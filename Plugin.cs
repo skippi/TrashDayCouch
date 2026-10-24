@@ -12,7 +12,9 @@ using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
+using UnityEngine.InputSystem.UI;
 using UnityEngine.InputSystem.Utilities;
+using UnityEngine.UIElements;
 
 namespace TrashDayCouch;
 
@@ -49,6 +51,14 @@ public class Plugin : BaseUnityPlugin
     static bool _throwCameraSwapped;
     static Vector3 _throwCameraPosition;
     static Quaternion _throwCameraRotation;
+    static PlayerController _customizePlayer;
+    static bool _pickCustomizePlayer;
+    static bool _replacingPlayer2;
+    static bool _blockCouchFocusSteal;
+    static List<PlayerController> _playersBeforeRespawn;
+    static readonly List<InputAction> _silencedMenuActions = new List<InputAction>();
+    static readonly Dictionary<VisualElement, PickingMode> _menuPicking = new Dictionary<VisualElement, PickingMode>();
+    static float _menuNavTime;
 
     private void Awake()
     {
@@ -66,6 +76,22 @@ public class Plugin : BaseUnityPlugin
         var highlight = AccessTools.Method(typeof(InteractionHighlight), "IsLocalPlayerFocused");
         if (highlight != null)
             _harmony.Patch(highlight, prefix: new HarmonyMethod(typeof(Plugin), nameof(HighlightForCouchPlayer)));
+        _harmony.Patch(AccessTools.Method(typeof(CustomizeInteraction), nameof(CustomizeInteraction.SetPredictedInteracting)), prefix: new HarmonyMethod(typeof(Plugin), nameof(RememberCustomizePlayer)), postfix: new HarmonyMethod(typeof(Plugin), nameof(UpdateCustomizeMenuControl)));
+        _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "ShouldShowCursor"), prefix: new HarmonyMethod(typeof(Plugin), nameof(HideCursorForPlayer2Menu)));
+        _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "UpdateShowCursor"), postfix: new HarmonyMethod(typeof(Plugin), nameof(LockCursorForPlayer2Menu)));
+        _harmony.Patch(AccessTools.Method(typeof(InputNavigationManager), "Update"), prefix: new HarmonyMethod(typeof(Plugin), nameof(KeepCustomizeOnButtons)));
+        _harmony.Patch(AccessTools.Method(typeof(PlayerLoadout), nameof(PlayerLoadout.SetLocalLoadout)), postfix: new HarmonyMethod(typeof(Plugin), nameof(ClearCustomizePlayer)));
+        var respawn = AccessTools.Method(typeof(PlayerSpawner), "RespawnInPlace");
+        if (respawn != null)
+            _harmony.Patch(respawn, prefix: new HarmonyMethod(typeof(Plugin), nameof(BeforeRespawn)), postfix: new HarmonyMethod(typeof(Plugin), nameof(AfterRespawn)));
+        else
+            Logger.LogWarning("Couldn't patch player respawn.");
+        _harmony.Patch(AccessTools.Method(typeof(PlayerSpawner), nameof(PlayerSpawner.TryGetPlayerOwnedBy)), prefix: new HarmonyMethod(typeof(Plugin), nameof(PickRespawnPlayer)));
+        var claimFocus = AccessTools.Method(typeof(LocalPlayerFocusTarget), "SetControlledOwnerRpc");
+        if (claimFocus != null)
+            _harmony.Patch(claimFocus, prefix: new HarmonyMethod(typeof(Plugin), nameof(BlockCouchFocusSteal)));
+        else
+            Logger.LogWarning("Couldn't patch local player focus.");
         PatchPromptRefresh("InputIcons.II_ImagePrompt", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
@@ -100,12 +126,17 @@ public class Plugin : BaseUnityPlugin
             if (gamepadConnected != _promptsForGamepad)
                 ApplyPromptDevices();
         }
+
+        UpdateCustomizeMenuControl();
     }
 
     private void LateUpdate()
     {
+        if (Player2OwnsCustomizeMenu())
+            LockCursorForPlayer2Menu();
         if (_split)
         {
+            EnsureMainCameras();
             ApplySplitRects();
             FitHud(FindPrimaryPlayer(), 0f, 0.5f);
             if (_player2 != null)
@@ -187,6 +218,7 @@ public class Plugin : BaseUnityPlugin
 
     static void TurnOff()
     {
+        ReleaseCustomizeMenuControl();
         if (_player2 != null)
         {
             ReleasePlayer2();
@@ -213,7 +245,7 @@ public class Plugin : BaseUnityPlugin
         if (controller == null)
             return;
 
-        if (Time.deltaTime == 0f || PlayerInput.IsSuppressed)
+        if (Time.deltaTime == 0f || PlayerInput.IsSuppressed || MenuSceneManager.IsMenuOpen)
         {
             controller.SetLocalMoveInput(Vector2.zero);
             _player2Look = Vector2.zero;
@@ -512,6 +544,273 @@ public class Plugin : BaseUnityPlugin
             _mainRects.Add(camera.rect);
         }
         ApplySplitRects();
+    }
+
+    static void RememberCustomizePlayer(NetworkObject player, bool interacting)
+    {
+        if (!interacting || player == null)
+            return;
+        var controller = player.GetComponentInParent<PlayerController>();
+        if (controller != null)
+            _customizePlayer = controller;
+    }
+
+    static void ClearCustomizePlayer()
+    {
+        ReleaseCustomizeMenuControl();
+        _customizePlayer = null;
+    }
+
+    static bool Player2OwnsCustomizeMenu()
+    {
+        return _player2 != null && _customizePlayer == _player2 && MenuSceneManager.IsMenuOpen;
+    }
+
+    static bool HideCursorForPlayer2Menu(ref bool __result)
+    {
+        if (!Player2OwnsCustomizeMenu())
+            return true;
+        __result = false;
+        return false;
+    }
+
+    static void LockCursorForPlayer2Menu()
+    {
+        if (!Player2OwnsCustomizeMenu())
+            return;
+        UnityEngine.Cursor.lockState = CursorLockMode.Locked;
+        UnityEngine.Cursor.visible = false;
+    }
+
+    static bool KeepCustomizeOnButtons(InputNavigationManager __instance)
+    {
+        if (!Player2OwnsCustomizeMenu())
+            return true;
+        AccessTools.Method(typeof(InputNavigationManager), "SetNavigationType")?.Invoke(__instance, new object[] { NavigationType.Button });
+        return false;
+    }
+
+    static void UpdateCustomizeMenuControl()
+    {
+        if (!Player2OwnsCustomizeMenu())
+        {
+            ReleaseCustomizeMenuControl();
+            return;
+        }
+
+        LockCursorForPlayer2Menu();
+        SilenceCustomizeMenuActions();
+        IgnoreCustomizePointer();
+        DriveCustomizeMenu();
+    }
+
+    static void SilenceCustomizeMenuActions()
+    {
+        if (_silencedMenuActions.Count > 0)
+            return;
+        foreach (var module in UnityEngine.Object.FindObjectsByType<InputSystemUIInputModule>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            SilenceMenuAction(module.point);
+            SilenceMenuAction(module.leftClick);
+            SilenceMenuAction(module.rightClick);
+            SilenceMenuAction(module.middleClick);
+            SilenceMenuAction(module.scrollWheel);
+            SilenceMenuAction(module.move);
+            SilenceMenuAction(module.submit);
+            SilenceMenuAction(module.cancel);
+        }
+    }
+
+    static void SilenceMenuAction(InputActionReference reference)
+    {
+        var action = reference?.action;
+        if (action == null || !action.enabled || _silencedMenuActions.Contains(action))
+            return;
+        action.Disable();
+        _silencedMenuActions.Add(action);
+    }
+
+    static void IgnoreCustomizePointer()
+    {
+        var root = CustomizeRoot();
+        if (root == null)
+            return;
+        root.Query<VisualElement>().ForEach(element =>
+        {
+            if (!_menuPicking.ContainsKey(element))
+                _menuPicking.Add(element, element.pickingMode);
+            element.pickingMode = PickingMode.Ignore;
+        });
+    }
+
+    static VisualElement CustomizeRoot()
+    {
+        var ui = UnityEngine.Object.FindFirstObjectByType<CustomizeUI>();
+        if (ui == null || !ui.isActiveAndEnabled)
+            return null;
+        return ui.GetComponent<UIDocument>()?.rootVisualElement;
+    }
+
+    static void DriveCustomizeMenu()
+    {
+        var focused = CustomizeRoot()?.panel?.focusController?.focusedElement as VisualElement;
+        if (focused == null)
+            return;
+
+        var move = Vector2.zero;
+        var submit = false;
+        var cancel = false;
+        var gamepad = Gamepad.all.Count > 0 ? Gamepad.all[0] : null;
+        if (gamepad != null)
+        {
+            move = gamepad.leftStick.ReadValue();
+            var dpad = gamepad.dpad.ReadValue();
+            if (dpad.sqrMagnitude > move.sqrMagnitude)
+                move = dpad;
+            submit = gamepad.buttonSouth.wasPressedThisFrame;
+            cancel = gamepad.buttonEast.wasPressedThisFrame;
+        }
+        else if (Keyboard.current != null)
+        {
+            var keyboard = Keyboard.current;
+            if (keyboard.lKey.isPressed) move.x += 1f;
+            if (keyboard.jKey.isPressed) move.x -= 1f;
+            if (keyboard.iKey.isPressed) move.y += 1f;
+            if (keyboard.kKey.isPressed) move.y -= 1f;
+            submit = keyboard.commaKey.wasPressedThisFrame || keyboard.nKey.wasPressedThisFrame;
+            cancel = keyboard.periodKey.wasPressedThisFrame;
+        }
+
+        var direction = Vector2.zero;
+        if (Mathf.Abs(move.x) >= Mathf.Abs(move.y))
+        {
+            if (move.x > 0.5f)
+                direction = Vector2.right;
+            else if (move.x < -0.5f)
+                direction = Vector2.left;
+        }
+        else if (move.y > 0.5f)
+            direction = Vector2.up;
+        else if (move.y < -0.5f)
+            direction = Vector2.down;
+
+        if (direction == Vector2.zero)
+            _menuNavTime = 0f;
+        else if (Time.unscaledTime >= _menuNavTime)
+        {
+            using (var moveEvent = NavigationMoveEvent.GetPooled(direction))
+                focused.SendEvent(moveEvent);
+            _menuNavTime = Time.unscaledTime + (_menuNavTime == 0f ? 0.38f : 0.16f);
+        }
+
+        if (submit)
+        {
+            using (var submitEvent = NavigationSubmitEvent.GetPooled())
+                focused.SendEvent(submitEvent);
+        }
+
+        if (cancel)
+        {
+            using (var cancelEvent = NavigationCancelEvent.GetPooled())
+                focused.SendEvent(cancelEvent);
+        }
+    }
+
+    static void ReleaseCustomizeMenuControl()
+    {
+        foreach (var action in _silencedMenuActions)
+        {
+            if (action != null)
+                action.Enable();
+        }
+        _silencedMenuActions.Clear();
+        foreach (var entry in _menuPicking)
+        {
+            if (entry.Key != null)
+                entry.Key.pickingMode = entry.Value;
+        }
+        _menuPicking.Clear();
+        _menuNavTime = 0f;
+    }
+
+    static void BeforeRespawn()
+    {
+        _pickCustomizePlayer = _customizePlayer != null;
+        _replacingPlayer2 = _customizePlayer != null && _customizePlayer == _player2;
+        _blockCouchFocusSteal = _replacingPlayer2;
+        _playersBeforeRespawn = new List<PlayerController>();
+        foreach (var player in PlayerController.All)
+            _playersBeforeRespawn.Add(player);
+    }
+
+    static bool PickRespawnPlayer(ulong clientId, ref PlayerController player, ref bool __result)
+    {
+        if (!_pickCustomizePlayer || _customizePlayer == null || _customizePlayer.OwnerClientId != clientId)
+            return true;
+        player = _customizePlayer;
+        __result = true;
+        return false;
+    }
+
+    static bool BlockCouchFocusSteal()
+    {
+        return !_blockCouchFocusSteal;
+    }
+
+    static void AfterRespawn()
+    {
+        _pickCustomizePlayer = false;
+        _blockCouchFocusSteal = false;
+        var replacingPlayer2 = _replacingPlayer2;
+        var before = _playersBeforeRespawn;
+        _replacingPlayer2 = false;
+        _playersBeforeRespawn = null;
+        if (!replacingPlayer2)
+            return;
+        PlayerController spawned = null;
+        foreach (var player in PlayerController.All)
+        {
+            if (player != null && (before == null || !before.Contains(player)))
+                spawned = player;
+        }
+        if (spawned != null)
+            AdoptPlayer2(spawned);
+    }
+
+    static void AdoptPlayer2(PlayerController spawned)
+    {
+        _player2 = spawned;
+        _player2Input = spawned.GetComponentInChildren<PlayerInput>(true);
+        foreach (var toggle in spawned.GetComponentsInChildren<LocalPlayerFocusToggle>(true))
+            toggle.SetState(false, false, false);
+        var playerCamera = spawned.GetComponentInChildren<PlayerCamera>(true);
+        if (playerCamera != null)
+        {
+            playerCamera.gameObject.SetActive(true);
+            playerCamera.Reset();
+        }
+        if (_player2Input != null)
+            _player2Input.gameObject.SetActive(true);
+        AimDetector(_player2);
+        FitHud(_player2, 0.5f, 1f);
+        ApplyPromptDevices();
+        ResetHeldButtons();
+        if (_camera2Root == null)
+            CreateSplitCamera();
+        _split = true;
+    }
+
+    static void EnsureMainCameras()
+    {
+        if (!LocalCamera.Instance.TryGet(out var localCamera))
+            return;
+        foreach (var camera in localCamera.GetComponentsInChildren<Camera>(true))
+        {
+            if (camera == null || _mainCameras.Contains(camera))
+                continue;
+            _mainCameras.Add(camera);
+            _mainRects.Add(new Rect(0f, 0f, 1f, 1f));
+        }
     }
 
     static void ApplySplitRects()
