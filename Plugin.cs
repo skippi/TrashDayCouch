@@ -45,6 +45,10 @@ public class Plugin : BaseUnityPlugin
     static readonly Dictionary<string, Sprite> _keySprites = new Dictionary<string, Sprite>();
     static bool _suppressLocalCamera;
     static bool _promptsForGamepad;
+    static GUIStyle _playerNameStyle;
+    static bool _throwCameraSwapped;
+    static Vector3 _throwCameraPosition;
+    static Quaternion _throwCameraRotation;
 
     private void Awake()
     {
@@ -57,6 +61,11 @@ public class Plugin : BaseUnityPlugin
         _harmony.Patch(AccessTools.Method(typeof(LocalPlayerFocusToggle), nameof(LocalPlayerFocusToggle.SetState)), prefix: new HarmonyMethod(typeof(Plugin), nameof(ShowPlayer2Controls)));
         _harmony.Patch(AccessTools.Method(typeof(LocalCamera), "OnEnable"), prefix: new HarmonyMethod(typeof(Plugin), nameof(AllowLocalCameraEnable)));
         _harmony.Patch(AccessTools.Method(typeof(LocalCamera), "OnDisable"), prefix: new HarmonyMethod(typeof(Plugin), nameof(AllowLocalCameraDisable)));
+        _harmony.Patch(AccessTools.Method(typeof(PlayerController), nameof(PlayerController.GetLocalCameraRaycast)), prefix: new HarmonyMethod(typeof(Plugin), nameof(Player2CameraRay)));
+        _harmony.Patch(AccessTools.Method(typeof(Inventory), nameof(Inventory.Throw)), prefix: new HarmonyMethod(typeof(Plugin), nameof(Player2ThrowStart)), postfix: new HarmonyMethod(typeof(Plugin), nameof(Player2ThrowEnd)));
+        var highlight = AccessTools.Method(typeof(InteractionHighlight), "IsLocalPlayerFocused");
+        if (highlight != null)
+            _harmony.Patch(highlight, prefix: new HarmonyMethod(typeof(Plugin), nameof(HighlightForCouchPlayer)));
         PatchPromptRefresh("InputIcons.II_ImagePrompt", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
@@ -114,6 +123,7 @@ public class Plugin : BaseUnityPlugin
         GUI.color = Color.black;
         GUI.DrawTexture(line, Texture2D.whiteTexture);
         GUI.color = previous;
+        DrawPlayer2Name();
     }
 
     static void TurnOn()
@@ -207,6 +217,8 @@ public class Plugin : BaseUnityPlugin
         {
             controller.SetLocalMoveInput(Vector2.zero);
             _player2Look = Vector2.zero;
+            if (controller.Pointing != null)
+                controller.Pointing.SetPointInput(PointInput.None);
             ReleasePlayer2();
             return;
         }
@@ -221,6 +233,7 @@ public class Plugin : BaseUnityPlugin
         var interact = false;
         var bite = false;
         var throwItem = false;
+        var point = PointInput.None;
 
         if (gamepad != null)
         {
@@ -241,6 +254,7 @@ public class Plugin : BaseUnityPlugin
             interact = ReadGamepad(gamepad, "Interact") > 0.5f;
             bite = ReadGamepad(gamepad, "Bite") > 0.5f;
             throwItem = ReadGamepad(gamepad, "Throw") > 0.5f;
+            point = ReadPoint(gamepad, move);
         }
         else if (keyboard != null)
         {
@@ -261,6 +275,18 @@ public class Plugin : BaseUnityPlugin
             interact = keyboard.commaKey.isPressed;
             bite = keyboard.bKey.isPressed;
             throwItem = keyboard.periodKey.isPressed;
+            if (keyboard.gKey.isPressed)
+            {
+                point |= PointInput.Pointing;
+                if (keyboard.lKey.isPressed)
+                    point |= PointInput.Right;
+                if (keyboard.jKey.isPressed)
+                    point |= PointInput.Left;
+                if (keyboard.iKey.isPressed)
+                    point |= PointInput.Up;
+                if (keyboard.kKey.isPressed)
+                    point |= PointInput.Down;
+            }
         }
 
         if (move.sqrMagnitude < 0.04f)
@@ -277,6 +303,8 @@ public class Plugin : BaseUnityPlugin
 
         _player2Look = look;
         controller.SetLocalMoveInput(move);
+        if (controller.Pointing != null)
+            controller.Pointing.SetPointInput(point);
         if (_camera2Root != null)
             controller.SetCameraRotation(_camera2Root.transform.rotation);
 
@@ -347,6 +375,7 @@ public class Plugin : BaseUnityPlugin
         if (_sprintHeld) _player2.SetSprintPressed(false);
         if (_attackHeld) _player2.SetAttackReleased();
         if (_biteHeld && _player2.Bite != null) _player2.Bite.SetBiteReleased();
+        if (_player2.Pointing != null) _player2.Pointing.SetPointInput(PointInput.None);
         if (_player2Input != null)
         {
             if (_interactHeld && _player2Input.InteractionDetector != null)
@@ -507,7 +536,7 @@ public class Plugin : BaseUnityPlugin
     {
         if (Gamepad.all.Count > 0)
             return "Gamepad: stick move/look, A jump, LB sprint, RT attack, X interact, Y throw, LT bite";
-        return "Keys: IJKL move, UO/YH look, N jump, RShift sprint, M attack, , interact, . throw, B bite";
+        return "Keys: IJKL move, UO/YH look, N jump, RShift sprint, M attack, , interact, . throw, B bite, G+IJKL emote";
     }
 
     static bool IsPlayer2(Component component)
@@ -528,6 +557,92 @@ public class Plugin : BaseUnityPlugin
     static void EndPlayer2Camera()
     {
         _drivingPlayer2 = false;
+    }
+
+    static void Player2ThrowStart(Inventory __instance)
+    {
+        _throwCameraSwapped = false;
+        if (!IsPlayer2(__instance) || _camera2Root == null || !LocalCamera.Instance.TryGet(out var localCamera))
+            return;
+        _throwCameraPosition = localCamera.Position;
+        _throwCameraRotation = localCamera.Rotation;
+        localCamera.Position = _camera2Root.transform.position;
+        localCamera.Rotation = _camera2Root.transform.rotation;
+        _throwCameraSwapped = true;
+    }
+
+    static void Player2ThrowEnd()
+    {
+        if (!_throwCameraSwapped)
+            return;
+        _throwCameraSwapped = false;
+        if (LocalCamera.Instance.TryGet(out var localCamera))
+        {
+            localCamera.Position = _throwCameraPosition;
+            localCamera.Rotation = _throwCameraRotation;
+        }
+    }
+
+    static bool HighlightForCouchPlayer(RefNotify<NetworkObject> focused, ref bool __result)
+    {
+        if (_player2 == null || !focused.TryGet(out var playerObject))
+            return true;
+        if (playerObject.TryGetComponent<PlayerController>(out var player) && player == _player2)
+        {
+            __result = true;
+            return false;
+        }
+        return true;
+    }
+
+    static bool Player2CameraRay(PlayerController __instance, ref Vector3 start, ref Vector3 dir)
+    {
+        if (!IsPlayer2(__instance))
+            return true;
+        var playerCamera = __instance.GetComponentInChildren<PlayerCamera>(true);
+        var camera = playerCamera != null ? playerCamera.transform : _camera2Root != null ? _camera2Root.transform : null;
+        if (camera == null)
+            return true;
+        dir = camera.forward;
+        start = camera.position;
+        start += dir * Vector3.Dot(__instance.transform.position - start, dir);
+        return false;
+    }
+
+    static void DrawPlayer2Name()
+    {
+        if (_playerNameStyle == null)
+        {
+            _playerNameStyle = new GUIStyle(GUI.skin.label)
+            {
+                fontSize = 22,
+                fontStyle = FontStyle.Bold,
+                alignment = TextAnchor.LowerLeft
+            };
+        }
+        var label = CouchPlayerName();
+        var area = new Rect(Screen.width * 0.5f + 28f, Screen.height - 72f, Screen.width * 0.5f - 56f, 40f);
+        _playerNameStyle.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
+        GUI.Label(new Rect(area.x + 2f, area.y + 2f, area.width, area.height), label, _playerNameStyle);
+        _playerNameStyle.normal.textColor = Color.white;
+        GUI.Label(area, label, _playerNameStyle);
+    }
+
+    static string CouchPlayerName()
+    {
+        var primary = FindPrimaryPlayer();
+        if (primary != null)
+        {
+            foreach (var online in OnlinePlayer.All)
+            {
+                if (online == null || online.OwnerClientId != primary.OwnerClientId)
+                    continue;
+                if (online.PlayerName.TryGet(out var value) && !string.IsNullOrEmpty(value))
+                    return value + "2";
+            }
+        }
+        var steamName = OnlineLocalPlayer.GetLocalPlayerSteamName();
+        return (string.IsNullOrEmpty(steamName) ? "Player" : steamName) + "2";
     }
 
     static bool ReadPlayer2Look(ref Vector2 __result)
@@ -556,6 +671,32 @@ public class Plugin : BaseUnityPlugin
             controlled = true;
         if (__instance.GetComponent<PlayerCamera>() != null || __instance.name == "PlayerHud")
             focused = true;
+    }
+
+    static PointInput ReadPoint(Gamepad pad, Vector2 move)
+    {
+        var point = PointInput.None;
+        if (ReadGamepad(pad, "Point") > 0.5f)
+        {
+            point |= PointInput.Pointing;
+            if (move.x > 0.5f)
+                point |= PointInput.Right;
+            if (move.x < -0.5f)
+                point |= PointInput.Left;
+            if (move.y > 0.5f)
+                point |= PointInput.Up;
+            if (move.y < -0.5f)
+                point |= PointInput.Down;
+        }
+        if (ReadGamepad(pad, "PointRight") > 0.5f)
+            point |= PointInput.Pointing | PointInput.Right;
+        if (ReadGamepad(pad, "PointLeft") > 0.5f)
+            point |= PointInput.Pointing | PointInput.Left;
+        if (ReadGamepad(pad, "PointUp") > 0.5f)
+            point |= PointInput.Pointing | PointInput.Up;
+        if (ReadGamepad(pad, "PointDown") > 0.5f)
+            point |= PointInput.Pointing | PointInput.Down;
+        return point;
     }
 
     static float ReadGamepad(Gamepad pad, string actionName)
@@ -759,6 +900,16 @@ public class Plugin : BaseUnityPlugin
             return "Period";
         if (action == "Bite")
             return "B";
+        if (action == "Point")
+            return "G";
+        if (action == "PointUp")
+            return "I";
+        if (action == "PointDown")
+            return "K";
+        if (action == "PointLeft")
+            return "J";
+        if (action == "PointRight")
+            return "L";
         return null;
     }
 
