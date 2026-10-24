@@ -1,4 +1,6 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Logging;
@@ -9,6 +11,7 @@ using PlayerInput = Trash.PlayerInput;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Controls;
 using UnityEngine.InputSystem.Utilities;
 
 namespace TrashDayCouch;
@@ -34,7 +37,14 @@ public class Plugin : BaseUnityPlugin
     static bool _throwHeld;
     static readonly List<Camera> _mainCameras = new List<Camera>();
     static readonly List<Rect> _mainRects = new List<Rect>();
+    static readonly List<RectTransform> _hudPaddings = new List<RectTransform>();
+    static readonly List<Vector2> _hudAnchorMin = new List<Vector2>();
+    static readonly List<Vector2> _hudAnchorMax = new List<Vector2>();
+    static readonly List<Vector2> _hudSize = new List<Vector2>();
+    static readonly List<Vector2> _hudPosition = new List<Vector2>();
+    static readonly Dictionary<string, Sprite> _keySprites = new Dictionary<string, Sprite>();
     static bool _suppressLocalCamera;
+    static bool _promptsForGamepad;
 
     private void Awake()
     {
@@ -47,6 +57,10 @@ public class Plugin : BaseUnityPlugin
         _harmony.Patch(AccessTools.Method(typeof(LocalPlayerFocusToggle), nameof(LocalPlayerFocusToggle.SetState)), prefix: new HarmonyMethod(typeof(Plugin), nameof(ShowPlayer2Controls)));
         _harmony.Patch(AccessTools.Method(typeof(LocalCamera), "OnEnable"), prefix: new HarmonyMethod(typeof(Plugin), nameof(AllowLocalCameraEnable)));
         _harmony.Patch(AccessTools.Method(typeof(LocalCamera), "OnDisable"), prefix: new HarmonyMethod(typeof(Plugin), nameof(AllowLocalCameraDisable)));
+        PatchPromptRefresh("InputIcons.II_ImagePrompt", "UpdateDisplayedImages");
+        PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
+        PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
+        PatchPromptRefresh("InputIcons.II_TextPrompt", "UpdateDisplayedSprites");
         Logger.LogInfo($"Plugin {MyPluginInfo.PLUGIN_GUID} is loaded. Press F7 to toggle player 2.");
     }
 
@@ -71,13 +85,23 @@ public class Plugin : BaseUnityPlugin
         }
 
         if (_player2 != null)
+        {
             DrivePlayer2();
+            var gamepadConnected = Gamepad.all.Count > 0;
+            if (gamepadConnected != _promptsForGamepad)
+                ApplyPromptDevices();
+        }
     }
 
     private void LateUpdate()
     {
         if (_split)
+        {
             ApplySplitRects();
+            FitHud(FindPrimaryPlayer(), 0f, 0.5f);
+            if (_player2 != null)
+                FitHud(_player2, 0.5f, 1f);
+        }
     }
 
     private void OnGUI()
@@ -90,7 +114,6 @@ public class Plugin : BaseUnityPlugin
         GUI.color = Color.black;
         GUI.DrawTexture(line, Texture2D.whiteTexture);
         GUI.color = previous;
-        GUI.Label(new Rect(Screen.width * 0.5f + 16f, 12f, 520f, 48f), "Player 2\n" + ControlHint());
     }
 
     static void TurnOn()
@@ -140,6 +163,11 @@ public class Plugin : BaseUnityPlugin
         if (_player2Input != null)
             _player2Input.gameObject.SetActive(true);
 
+        AimDetector(local);
+        AimDetector(_player2);
+        FitHud(local, 0f, 0.5f);
+        FitHud(_player2, 0.5f, 1f);
+        ApplyPromptDevices();
         CreateSplitCamera();
         RestrictPlayer1ToKeyboardMouse();
         ResetHeldButtons();
@@ -160,6 +188,7 @@ public class Plugin : BaseUnityPlugin
 
         _player2 = null;
         _player2Input = null;
+        RestoreHuds();
         RestoreCameras();
         RestoreInputDevices();
         ResetHeldButtons();
@@ -195,16 +224,23 @@ public class Plugin : BaseUnityPlugin
 
         if (gamepad != null)
         {
-            move = gamepad.leftStick.ReadValue();
-            var stick = gamepad.rightStick.ReadValue();
+            move.x = ReadGamepad(gamepad, "MoveRight") - ReadGamepad(gamepad, "MoveLeft");
+            move.y = ReadGamepad(gamepad, "MoveForward") - ReadGamepad(gamepad, "MoveBack");
+            if (move.sqrMagnitude < 0.04f)
+                move = gamepad.leftStick.ReadValue();
+            var lookX = ReadGamepad(gamepad, "LookRight") - ReadGamepad(gamepad, "LookLeft");
+            var lookY = ReadGamepad(gamepad, "LookUp") - ReadGamepad(gamepad, "LookDown");
+            var stick = new Vector2(lookX, lookY);
+            if (stick.sqrMagnitude < 0.04f)
+                stick = gamepad.rightStick.ReadValue();
             if (stick.sqrMagnitude > 0.04f)
                 look = stick * Time.deltaTime * 160f;
-            jump = gamepad.buttonSouth.isPressed;
-            sprint = gamepad.leftShoulder.isPressed;
-            attack = gamepad.rightTrigger.isPressed;
-            interact = gamepad.buttonWest.isPressed;
-            bite = gamepad.leftTrigger.isPressed;
-            throwItem = gamepad.buttonNorth.isPressed;
+            jump = ReadGamepad(gamepad, "Jump") > 0.5f;
+            sprint = ReadGamepad(gamepad, "Sprint") > 0.5f;
+            attack = ReadGamepad(gamepad, "Attack") > 0.5f;
+            interact = ReadGamepad(gamepad, "Interact") > 0.5f;
+            bite = ReadGamepad(gamepad, "Bite") > 0.5f;
+            throwItem = ReadGamepad(gamepad, "Throw") > 0.5f;
         }
         else if (keyboard != null)
         {
@@ -518,8 +554,230 @@ public class Plugin : BaseUnityPlugin
             return;
         if (__instance.GetComponent<PlayerInput>() != null)
             controlled = true;
-        if (__instance.GetComponent<PlayerCamera>() != null)
+        if (__instance.GetComponent<PlayerCamera>() != null || __instance.name == "PlayerHud")
             focused = true;
+    }
+
+    static float ReadGamepad(Gamepad pad, string actionName)
+    {
+        var action = InputSystem.actions != null ? InputSystem.actions.FindAction(actionName, false) : null;
+        if (action == null)
+            return 0f;
+        var best = 0f;
+        for (var i = 0; i < action.bindings.Count; i++)
+        {
+            var binding = action.bindings[i];
+            if (binding.isComposite)
+                continue;
+            var path = string.IsNullOrEmpty(binding.effectivePath) ? binding.path : binding.effectivePath;
+            if (string.IsNullOrEmpty(path) || path.IndexOf("Gamepad", StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+            var control = InputControlPath.TryFindControl(pad, path);
+            if (control != null)
+                best = Mathf.Max(best, ReadControl(control));
+        }
+        return best;
+    }
+
+    static float ReadControl(InputControl control)
+    {
+        if (control is AxisControl axis)
+            return axis.ReadValue();
+        if (control is ButtonControl button)
+            return button.ReadValue();
+        if (control is Vector2Control vector)
+            return vector.ReadValue().magnitude;
+        return 0f;
+    }
+
+    static void AimDetector(PlayerController player)
+    {
+        var detector = player.GetComponentInChildren<InteractionDetector>(true);
+        var playerCamera = player.GetComponentInChildren<PlayerCamera>(true);
+        if (detector == null || playerCamera == null)
+            return;
+        if (detector.CameraTransform == null || !detector.CameraTransform.IsChildOf(player.transform))
+            detector.CameraTransform = playerCamera.transform;
+    }
+
+    static void FitHud(PlayerController player, float minX, float maxX)
+    {
+        if (player == null)
+            return;
+        var padding = player.transform.Find("PlayerHud/Screen Padding") as RectTransform;
+        if (padding == null)
+            return;
+        if (!_hudPaddings.Contains(padding))
+        {
+            _hudPaddings.Add(padding);
+            _hudAnchorMin.Add(padding.anchorMin);
+            _hudAnchorMax.Add(padding.anchorMax);
+            _hudSize.Add(padding.sizeDelta);
+            _hudPosition.Add(padding.anchoredPosition);
+        }
+        padding.anchorMin = new Vector2(minX, 0f);
+        padding.anchorMax = new Vector2(maxX, 1f);
+        padding.offsetMin = new Vector2(25f, 25f);
+        padding.offsetMax = new Vector2(-25f, -25f);
+    }
+
+    static void RestoreHuds()
+    {
+        for (var i = 0; i < _hudPaddings.Count; i++)
+        {
+            var padding = _hudPaddings[i];
+            if (padding == null)
+                continue;
+            padding.anchorMin = _hudAnchorMin[i];
+            padding.anchorMax = _hudAnchorMax[i];
+            padding.sizeDelta = _hudSize[i];
+            padding.anchoredPosition = _hudPosition[i];
+        }
+        _hudPaddings.Clear();
+        _hudAnchorMin.Clear();
+        _hudAnchorMax.Clear();
+        _hudSize.Clear();
+        _hudPosition.Clear();
+        _promptsForGamepad = false;
+    }
+
+    static void ApplyPromptDevices()
+    {
+        _promptsForGamepad = Gamepad.all.Count > 0;
+        var primary = FindPrimaryPlayer();
+        if (primary != null)
+            SetPromptDevice(primary.gameObject, "KeyboardAndMouse");
+        if (_player2 != null)
+            SetPromptDevice(_player2.gameObject, _promptsForGamepad ? "Gamepad" : "KeyboardAndMouse");
+    }
+
+    static void SetPromptDevice(GameObject root, string deviceType)
+    {
+        foreach (var behaviour in root.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (behaviour == null || behaviour.GetType().Namespace != "InputIcons")
+                continue;
+            var changed = false;
+            foreach (var field in behaviour.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (field.GetValue(behaviour) is not IList list)
+                    continue;
+                foreach (var item in list)
+                {
+                    var deviceField = item?.GetType().GetField("deviceType");
+                    if (deviceField == null)
+                        continue;
+                    deviceField.SetValue(item, Enum.Parse(deviceField.FieldType, deviceType));
+                    changed = true;
+                }
+            }
+            if (!changed)
+                continue;
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var update = behaviour.GetType().GetMethod("UpdateDisplayedImages", flags, null, Type.EmptyTypes, null)
+                ?? behaviour.GetType().GetMethod("UpdateDisplayedSprites", flags, null, Type.EmptyTypes, null);
+            update?.Invoke(behaviour, null);
+        }
+    }
+
+    static void PatchPromptRefresh(string typeName, string methodName)
+    {
+        var type = AccessTools.TypeByName(typeName);
+        var method = type == null ? null : AccessTools.Method(type, methodName, new[] { typeof(bool) }) ?? AccessTools.Method(type, methodName);
+        if (method != null)
+            _harmony.Patch(method, postfix: new HarmonyMethod(typeof(Plugin), nameof(AfterPromptRefresh)));
+    }
+
+    static void AfterPromptRefresh(Component __instance)
+    {
+        if (_player2 == null || Gamepad.all.Count > 0 || __instance == null)
+            return;
+        if (__instance.GetComponentInParent<PlayerController>() != _player2)
+            return;
+        OverrideKeyboardPrompt(__instance);
+    }
+
+    static void OverrideKeyboardPrompt(Component prompt)
+    {
+        var list = prompt.GetType().GetField("spritePromptDatas")?.GetValue(prompt) as IList;
+        if (list == null)
+            return;
+        foreach (var item in list)
+        {
+            if (item == null)
+                continue;
+            var actionReference = item.GetType().GetField("actionReference")?.GetValue(item);
+            var action = actionReference?.GetType().GetProperty("action")?.GetValue(actionReference) as InputAction;
+            var bindingType = item.GetType().GetField("bindingType")?.GetValue(item);
+            var key = KeyForAction(action != null ? action.name : null, bindingType != null ? bindingType.ToString() : null);
+            var sprite = key != null ? KeySprite(key) : null;
+            var image = item.GetType().GetField("image")?.GetValue(item);
+            if (sprite != null && image != null)
+                image.GetType().GetProperty("sprite")?.SetValue(image, sprite);
+        }
+    }
+
+    static string KeyForAction(string action, string bindingType)
+    {
+        if (action == "MoveForward")
+            return "I";
+        if (action == "MoveBack")
+            return "K";
+        if (action == "MoveLeft")
+            return "J";
+        if (action == "MoveRight")
+            return "L";
+        if (action == "Move")
+        {
+            if (bindingType == "Up" || bindingType == "Forward")
+                return "I";
+            if (bindingType == "Down" || bindingType == "Backward")
+                return "K";
+            if (bindingType == "Left")
+                return "J";
+            if (bindingType == "Right")
+                return "L";
+            return null;
+        }
+        if (action == "LookUp")
+            return "Y";
+        if (action == "LookDown")
+            return "H";
+        if (action == "LookLeft")
+            return "U";
+        if (action == "LookRight")
+            return "O";
+        if (action == "Jump")
+            return "N";
+        if (action == "Sprint")
+            return "RightShift";
+        if (action == "Attack")
+            return "M";
+        if (action == "Interact")
+            return "Comma";
+        if (action == "Throw")
+            return "Period";
+        if (action == "Bite")
+            return "B";
+        return null;
+    }
+
+    static Sprite KeySprite(string key)
+    {
+        if (_keySprites.TryGetValue(key, out var cached))
+            return cached;
+        var prefix = (key + "_Key").ToUpperInvariant();
+        Sprite found = null;
+        foreach (var sprite in Resources.FindObjectsOfTypeAll<Sprite>())
+        {
+            if (sprite.name.ToUpperInvariant().StartsWith(prefix))
+            {
+                found = sprite;
+                break;
+            }
+        }
+        _keySprites[key] = found;
+        return found;
     }
 
     static bool AllowLocalCameraEnable(LocalCamera __instance)
