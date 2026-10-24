@@ -219,6 +219,7 @@ public class Plugin : BaseUnityPlugin
             _player2Look = Vector2.zero;
             if (controller.Pointing != null)
                 controller.Pointing.SetPointInput(PointInput.None);
+            controller.AdjustHeldItem(false, Vector3Int.zero, 0f);
             ReleasePlayer2();
             return;
         }
@@ -234,6 +235,7 @@ public class Plugin : BaseUnityPlugin
         var bite = false;
         var throwItem = false;
         var point = PointInput.None;
+        var pointHeld = false;
 
         if (gamepad != null)
         {
@@ -255,6 +257,7 @@ public class Plugin : BaseUnityPlugin
             bite = ReadGamepad(gamepad, "Bite") > 0.5f;
             throwItem = ReadGamepad(gamepad, "Throw") > 0.5f;
             point = ReadPoint(gamepad, move);
+            pointHeld = ReadGamepad(gamepad, "Point") > 0.5f;
         }
         else if (keyboard != null)
         {
@@ -277,6 +280,7 @@ public class Plugin : BaseUnityPlugin
             throwItem = keyboard.periodKey.isPressed;
             if (keyboard.gKey.isPressed)
             {
+                pointHeld = true;
                 point |= PointInput.Pointing;
                 if (keyboard.lKey.isPressed)
                     point |= PointInput.Right;
@@ -305,6 +309,31 @@ public class Plugin : BaseUnityPlugin
         controller.SetLocalMoveInput(move);
         if (controller.Pointing != null)
             controller.Pointing.SetPointInput(point);
+        var rotate = Vector3Int.zero;
+        var modifying = pointHeld && controller.Inventory != null && controller.Inventory.HasItem();
+        if (modifying)
+        {
+            if (move.y > 0.5f)
+                rotate.x++;
+            if (move.y < -0.5f)
+                rotate.x--;
+            if (move.x > 0.5f)
+                rotate.y--;
+            if (move.x < -0.5f)
+                rotate.y++;
+            if (gamepad != null)
+            {
+                if (ReadGamepad(gamepad, "PointUp") > 0.5f)
+                    rotate.x++;
+                if (ReadGamepad(gamepad, "PointDown") > 0.5f)
+                    rotate.x--;
+                if (ReadGamepad(gamepad, "PointRight") > 0.5f)
+                    rotate.y--;
+                if (ReadGamepad(gamepad, "PointLeft") > 0.5f)
+                    rotate.y++;
+            }
+        }
+        controller.AdjustHeldItem(modifying, rotate, 0f);
         if (_camera2Root != null)
             controller.SetCameraRotation(_camera2Root.transform.rotation);
 
@@ -376,6 +405,7 @@ public class Plugin : BaseUnityPlugin
         if (_attackHeld) _player2.SetAttackReleased();
         if (_biteHeld && _player2.Bite != null) _player2.Bite.SetBiteReleased();
         if (_player2.Pointing != null) _player2.Pointing.SetPointInput(PointInput.None);
+        _player2.AdjustHeldItem(false, Vector3Int.zero, 0f);
         if (_player2Input != null)
         {
             if (_interactHeld && _player2Input.InteractionDetector != null)
