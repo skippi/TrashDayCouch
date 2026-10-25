@@ -65,6 +65,11 @@ public class Plugin : BaseUnityPlugin
     static readonly List<SkinnedMeshRenderer> _openedFurSkins = new List<SkinnedMeshRenderer>();
     static float _menuNavTime;
     static bool _hidCursorForPlayer2;
+    static bool _player2Spectating;
+    static PlayerController _player2SpectateTarget;
+    static float _player2DeathTime = -1f;
+    static bool _spectateSource;
+    static bool _spectateSourceKeepsView;
         
     private void Awake()
     {
@@ -104,6 +109,9 @@ public class Plugin : BaseUnityPlugin
             _harmony.Patch(deathSpectate, prefix: new HarmonyMethod(typeof(Plugin), nameof(OnlyPrimaryPlayerSpectates)));
         else
             Logger.LogWarning("Couldn't patch death spectate.");
+        var spectatorName = AccessTools.Method(typeof(SpectatorUI), "OnLocalPlayerChanged");
+        if (spectatorName != null)
+            _harmony.Patch(spectatorName, postfix: new HarmonyMethod(typeof(Plugin), nameof(UseCouchSpectatorName)));
         PatchPromptRefresh("InputIcons.II_ImagePrompt", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
@@ -144,6 +152,7 @@ public class Plugin : BaseUnityPlugin
 
         if (_player2 != null)
         {
+            UpdatePlayer2DeathSpectate();
             DrivePlayer2();
             var gamepadConnected = Gamepad.all.Count > 0;
             if (gamepadConnected != _promptsForGamepad)
@@ -166,6 +175,8 @@ public class Plugin : BaseUnityPlugin
             if (_player2 != null)
                 FitHud(_player2, 0.5f, 1f);
             AimFurCameras();
+            SamplePlayer2Spectate();
+            ShowPlayer2SpectatorUi();
         }
     }
 
@@ -255,6 +266,9 @@ public class Plugin : BaseUnityPlugin
 
         _player2 = null;
         _player2Input = null;
+        _player2Spectating = false;
+        _player2SpectateTarget = null;
+        _player2DeathTime = -1f;
         RestoreHuds();
         RestoreCameras();
         RestoreNameplateCanvases();
@@ -357,6 +371,41 @@ public class Plugin : BaseUnityPlugin
             move = Vector2.zero;
         else if (move.sqrMagnitude > 1f)
             move.Normalize();
+
+        if (Player2Spectating())
+        {
+            if (_player2SpectateTarget == null)
+                _player2SpectateTarget = _player2;
+            else if (_player2SpectateTarget != _player2 && _player2SpectateTarget.IsDead)
+            {
+                var living = NextSpectateTarget(_player2SpectateTarget);
+                var guard = 0;
+                while (living != null && living.IsDead && living != _player2SpectateTarget && guard < 8)
+                {
+                    living = NextSpectateTarget(living);
+                    guard++;
+                }
+                if (living != null && !living.IsDead)
+                    _player2SpectateTarget = living;
+            }
+            controller.SetLocalMoveInput(Vector2.zero);
+            _player2Look = Vector2.zero;
+            if (controller.Pointing != null)
+                controller.Pointing.SetPointInput(PointInput.None);
+            controller.AdjustHeldItem(false, Vector3Int.zero, 0f);
+            var attackWasHeld = _attackHeld;
+            var jumpWasHeld = _jumpHeld;
+            ReleasePlayer2();
+            if ((attack && !attackWasHeld) || (jump && !jumpWasHeld))
+                _player2SpectateTarget = NextSpectateTarget(_player2SpectateTarget);
+            _jumpHeld = jump;
+            _sprintHeld = sprint;
+            _attackHeld = attack;
+            _interactHeld = interact;
+            _biteHeld = bite;
+            _throwHeld = throwItem;
+            return;
+        }
 
         if (Options.Instance != null)
         {
@@ -1165,11 +1214,35 @@ public class Plugin : BaseUnityPlugin
     static void BeginPlayer2Camera(PlayerCamera __instance)
     {
         _drivingPlayer2 = IsPlayer2(__instance);
+        _spectateSource = false;
+        _spectateSourceKeepsView = false;
+        if (!Player2Spectating() || __instance == null)
+            return;
+        var owner = __instance.GetComponentInParent<PlayerController>(true);
+        if (owner == null || owner != _player2SpectateTarget)
+            return;
+        _spectateSource = true;
+        _spectateSourceKeepsView = owner == FindPrimaryPlayer();
     }
 
-    static void EndPlayer2Camera()
+    static void EndPlayer2Camera(PlayerCamera __instance)
     {
+        if (Player2Spectating() && __instance != null && _camera2Root != null && __instance.GetComponentInParent<PlayerController>(true) == _player2SpectateTarget)
+        {
+            var fov = 60f;
+            foreach (var camera in _mainCameras)
+            {
+                if (camera != null && camera.enabled)
+                {
+                    fov = camera.fieldOfView;
+                    break;
+                }
+            }
+            PoseCamera(_camera2Root, __instance.transform.position, __instance.transform.rotation, fov);
+        }
         _drivingPlayer2 = false;
+        _spectateSource = false;
+        _spectateSourceKeepsView = false;
     }
 
     static void Player2ThrowStart(Inventory __instance)
@@ -1272,11 +1345,16 @@ public class Plugin : BaseUnityPlugin
 
     static bool RedirectPlayer2Camera(Vector3 position, Quaternion rotation, float fov)
     {
+        if (_spectateSource && _camera2Root != null)
+        {
+            PoseCamera(_camera2Root, position, rotation, fov);
+            return _spectateSourceKeepsView;
+        }
         if (!_drivingPlayer2 || _camera2Root == null)
             return true;
-        _camera2Root.transform.SetPositionAndRotation(position, rotation);
-        foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
-            camera.fieldOfView = fov;
+        if (Player2Spectating() && _player2SpectateTarget != _player2)
+            return false;
+        PoseCamera(_camera2Root, position, rotation, fov);
         if (SpectatingPlayer(_player2) && LocalCamera.Instance.TryGet(out var localCamera))
         {
             localCamera.transform.SetPositionAndRotation(position, rotation);
@@ -1289,12 +1367,167 @@ public class Plugin : BaseUnityPlugin
         return false;
     }
 
-    static bool OnlyPrimaryPlayerSpectates(PlayerDeathSpectator __instance)
+    static void PoseCamera(GameObject root, Vector3 position, Quaternion rotation, float fov)
+    {
+        if (root == null)
+            return;
+        root.transform.SetPositionAndRotation(position, rotation);
+        foreach (var camera in root.GetComponentsInChildren<Camera>(true))
+            camera.fieldOfView = fov;
+    }
+
+    static bool OnlyPrimaryPlayerSpectates(PlayerDeathSpectator __instance, bool spectating)
     {
         if (!_split || _player2 == null || __instance == null)
             return true;
         var owner = __instance.Health != null ? __instance.Health.GetComponentInParent<PlayerController>(true) : __instance.GetComponentInParent<PlayerController>(true);
-        return owner != _player2;
+        if (owner != _player2)
+            return true;
+        _player2Spectating = spectating;
+        _player2SpectateTarget = spectating ? NextSpectateTarget(null) : null;
+        return false;
+    }
+
+    static bool Player2Spectating()
+    {
+        return _split && _player2Spectating && _player2 != null && _player2SpectateTarget != null;
+    }
+
+    static void UpdatePlayer2DeathSpectate()
+    {
+        if (_player2 == null || !_split)
+            return;
+        if (!_player2.IsDead)
+        {
+            _player2DeathTime = -1f;
+            if (_player2Spectating)
+            {
+                _player2Spectating = false;
+                _player2SpectateTarget = null;
+            }
+            return;
+        }
+        if (_player2DeathTime < 0f)
+            _player2DeathTime = Time.unscaledTime;
+        var delay = 2f;
+        var spectator = _player2.GetComponentInChildren<PlayerDeathSpectator>(true);
+        if (spectator != null)
+            delay = spectator.SpectatorDelay;
+        if (Time.unscaledTime - _player2DeathTime < delay)
+            return;
+        if (_player2SpectateTarget == null)
+            _player2SpectateTarget = _player2;
+        _player2Spectating = _player2SpectateTarget != null;
+    }
+
+    static PlayerController NextSpectateTarget(PlayerController current)
+    {
+        var players = new System.Collections.Generic.List<PlayerController>();
+        if (_player2 != null)
+            players.Add(_player2);
+        foreach (var focus in LocalPlayerFocusTarget.All.Items)
+        {
+            if (focus == null)
+                continue;
+            var player = focus.GetComponent<PlayerController>() ?? focus.GetComponentInParent<PlayerController>(true);
+            if (player == null || players.Contains(player))
+                continue;
+            players.Add(player);
+        }
+        if (players.Count == 0)
+            return null;
+        var index = current == null ? -1 : players.IndexOf(current);
+        return players[(index + 1) % players.Count];
+    }
+
+    static void SamplePlayer2Spectate()
+    {
+        if (!Player2Spectating() || _camera2Root == null || _player2SpectateTarget == null)
+            return;
+        var camera = _player2SpectateTarget.GetComponentInChildren<PlayerCamera>(true);
+        if (camera != null && camera.isActiveAndEnabled)
+            return;
+        Vector3 position;
+        Quaternion rotation;
+        if (camera != null && (camera.transform.position - _player2SpectateTarget.transform.position).sqrMagnitude < 36f)
+        {
+            position = camera.transform.position;
+            rotation = camera.transform.rotation;
+        }
+        else
+        {
+            rotation = Quaternion.Euler(25f, _player2SpectateTarget.transform.eulerAngles.y, 0f);
+            var focus = _player2SpectateTarget.transform.position + Vector3.up * 1.4f;
+            position = focus - rotation * Vector3.forward * 2.4f;
+        }
+        var view = _camera2Root.GetComponentInChildren<Camera>();
+        PoseCamera(_camera2Root, position, rotation, view != null ? view.fieldOfView : 60f);
+    }
+
+    static void ShowPlayer2SpectatorUi()
+    {
+        if (_player2 == null)
+            return;
+        var show = Player2Spectating();
+        var label = show ? SpectateTargetName(_player2SpectateTarget) : null;
+        foreach (var ui in _player2.GetComponentsInChildren<SpectatorUI>(true))
+        {
+            var toggle = ui.GetComponent<LocalPlayerFocusToggle>();
+            if (toggle == null)
+                toggle = ui.GetComponentInParent<LocalPlayerFocusToggle>(true);
+            if (show && !ui.gameObject.activeInHierarchy)
+            {
+                if (toggle != null)
+                    toggle.SetState(true, true, true);
+                var node = ui.transform;
+                while (node != null && node.GetComponent<PlayerController>() == null)
+                {
+                    if (!node.gameObject.activeSelf)
+                        node.gameObject.SetActive(true);
+                    node = node.parent;
+                }
+            }
+            else if (!show && ui.gameObject.activeSelf && toggle != null)
+            {
+                toggle.SetState(true, true, false);
+            }
+            if (show && ui.PlayerNameText != null)
+                ui.PlayerNameText.text = label;
+        }
+        if (!SpectatingPlayer(_player2))
+            return;
+        var couchName = CouchPlayerName();
+        foreach (var ui in UnityEngine.Object.FindObjectsByType<SpectatorUI>(FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+        {
+            if (ui == null || ui.PlayerNameText == null || !ui.gameObject.activeInHierarchy)
+                continue;
+            if (ui.GetComponentInParent<PlayerController>(true) == _player2)
+                continue;
+            ui.PlayerNameText.text = couchName;
+        }
+    }
+
+    static void UseCouchSpectatorName(SpectatorUI __instance)
+    {
+        if (__instance == null || __instance.PlayerNameText == null || _player2 == null)
+            return;
+        var owner = __instance.GetComponentInParent<PlayerController>(true);
+        var watchingPlayer2 = owner == _player2 ? Player2Spectating() && _player2SpectateTarget == _player2 : SpectatingPlayer(_player2);
+        if (watchingPlayer2)
+            __instance.PlayerNameText.text = CouchPlayerName();
+    }
+
+    static string SpectateTargetName(PlayerController player)
+    {
+        if (player == null)
+            return "";
+        if (player == _player2)
+            return CouchPlayerName();
+        var focus = player.GetComponent<LocalPlayerFocusTarget>();
+        if (focus != null && focus.Controller.TryGet(out var online) && online != null && online.PlayerName.TryGet(out var value) && !string.IsNullOrEmpty(value))
+            return value;
+        var steamName = OnlineLocalPlayer.GetLocalPlayerSteamName();
+        return string.IsNullOrEmpty(steamName) ? "Player" : steamName;
     }
 
     static bool SpectatingPlayer(PlayerController player)
@@ -1315,10 +1548,13 @@ public class Plugin : BaseUnityPlugin
         }
         if (_split && __instance.Activation == LocalPlayerFocusToggle.ActivationOption.Spectated)
         {
-            if (IsPlayer2(__instance))
-                spectated = false;
-            else if (SpectatingPlayer(_player2) && __instance.GetComponentInParent<PlayerController>(true) == FindPrimaryPlayer())
+            var owner = __instance.GetComponentInParent<PlayerController>(true);
+            if (owner == _player2)
+                spectated = Player2Spectating();
+            else if (SpectatingPlayer(_player2) && owner == FindPrimaryPlayer())
                 spectated = true;
+            else if (Player2Spectating() && owner != null && owner == _player2SpectateTarget)
+                spectated = false;
         }
         if (_split && SpectatingPlayer(_player2) && __instance.name == "PlayerHud" && __instance.GetComponentInParent<PlayerController>(true) == FindPrimaryPlayer())
             focused = true;
