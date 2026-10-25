@@ -99,6 +99,11 @@ public class Plugin : BaseUnityPlugin
             _harmony.Patch(claimFocus, prefix: new HarmonyMethod(typeof(Plugin), nameof(BlockCouchFocusSteal)));
         else
             Logger.LogWarning("Couldn't patch local player focus.");
+        var deathSpectate = AccessTools.Method(typeof(PlayerDeathSpectator), "SetSpectating");
+        if (deathSpectate != null)
+            _harmony.Patch(deathSpectate, prefix: new HarmonyMethod(typeof(Plugin), nameof(OnlyPrimaryPlayerSpectates)));
+        else
+            Logger.LogWarning("Couldn't patch death spectate.");
         PatchPromptRefresh("InputIcons.II_ImagePrompt", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
@@ -117,7 +122,10 @@ public class Plugin : BaseUnityPlugin
     static void BeforeSplitCamera(ScriptableRenderContext context, Camera camera)
     {
         if (_split && IsSplitCamera(camera))
+        {
+            ApplySplitRects();
             KeepNameplatesActive();
+        }
     }
 
     private void Update()
@@ -829,9 +837,8 @@ public class Plugin : BaseUnityPlugin
             RestoreNameplateCanvas(canvas);
             return;
         }
-        if (!IsSplitCamera(c))
-            return;
         RestoreNameplateCanvas(canvas);
+        ApplySplitRects();
 
         var viewer = IsPlayer2(__instance) ? SplitCamera(false) : SplitCamera(true);
         if (viewer == null)
@@ -840,7 +847,9 @@ public class Plugin : BaseUnityPlugin
         if (__instance.PlayerPointing != null)
             position.y += __instance.PlayerPointing.PointingBlend * __instance.PointingHeightOffset;
         var toCamera = position - viewer.transform.position;
-        if (Vector3.Dot(viewer.transform.forward, toCamera) <= 0f)
+        var viewport = viewer.WorldToViewportPoint(position);
+        var pixel = viewer.pixelRect;
+        if (Vector3.Dot(viewer.transform.forward, toCamera) <= 0f || viewport.z <= 0.1f || viewport.x < 0f || viewport.x > 1f || viewport.y < 0f || viewport.y > 1f)
         {
             __instance.CanvasGroup.alpha = 0f;
             return;
@@ -849,9 +858,10 @@ public class Plugin : BaseUnityPlugin
         var distance = toCamera.magnitude;
         __instance.CanvasGroup.alpha = __instance.AlphaForDistance.Eval(distance);
         __instance.Container.localScale = Vector3.one * __instance.ScaleForDistance.Eval(distance);
-        var viewport = viewer.WorldToViewportPoint(position);
-        var pixel = viewer.pixelRect;
-        var screen = new Vector2(pixel.x + viewport.x * pixel.width, pixel.y + viewport.y * pixel.height);
+        var margin = 36f;
+        var screen = new Vector2(
+            Mathf.Clamp(pixel.x + viewport.x * pixel.width, pixel.xMin + margin, Mathf.Max(pixel.xMin + margin, pixel.xMax - margin)),
+            Mathf.Clamp(pixel.y + viewport.y * pixel.height, pixel.yMin + margin, Mathf.Max(pixel.yMin + margin, pixel.yMax - margin)));
         if (RectTransformUtility.ScreenPointToLocalPointInRectangle((RectTransform)__instance.Container.parent, screen, null, out var localPoint))
             __instance.Container.localPosition = localPoint;
     }
@@ -1267,10 +1277,34 @@ public class Plugin : BaseUnityPlugin
         _camera2Root.transform.SetPositionAndRotation(position, rotation);
         foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
             camera.fieldOfView = fov;
+        if (SpectatingPlayer(_player2) && LocalCamera.Instance.TryGet(out var localCamera))
+        {
+            localCamera.transform.SetPositionAndRotation(position, rotation);
+            foreach (var camera in _mainCameras)
+            {
+                if (camera != null)
+                    camera.fieldOfView = fov;
+            }
+        }
         return false;
     }
 
-    static void ShowPlayer2Controls(LocalPlayerFocusToggle __instance, ref bool controlled, ref bool focused)
+    static bool OnlyPrimaryPlayerSpectates(PlayerDeathSpectator __instance)
+    {
+        if (!_split || _player2 == null || __instance == null)
+            return true;
+        var owner = __instance.Health != null ? __instance.Health.GetComponentInParent<PlayerController>(true) : __instance.GetComponentInParent<PlayerController>(true);
+        return owner != _player2;
+    }
+
+    static bool SpectatingPlayer(PlayerController player)
+    {
+        if (!_split || player == null || !LocalPlayer.Instance.TryGet(out var local) || local == null || !local.IsSpectating || local.FocusTarget == null)
+            return false;
+        return local.FocusTarget.GetComponentInParent<PlayerController>(true) == player;
+    }
+
+    static void ShowPlayer2Controls(LocalPlayerFocusToggle __instance, ref bool controlled, ref bool focused, ref bool spectated)
     {
         if (_split && IsNameplateToggle(__instance))
         {
@@ -1279,6 +1313,15 @@ public class Plugin : BaseUnityPlugin
             if (__instance.Activation == LocalPlayerFocusToggle.ActivationOption.NotControlled)
                 controlled = false;
         }
+        if (_split && __instance.Activation == LocalPlayerFocusToggle.ActivationOption.Spectated)
+        {
+            if (IsPlayer2(__instance))
+                spectated = false;
+            else if (SpectatingPlayer(_player2) && __instance.GetComponentInParent<PlayerController>(true) == FindPrimaryPlayer())
+                spectated = true;
+        }
+        if (_split && SpectatingPlayer(_player2) && __instance.name == "PlayerHud" && __instance.GetComponentInParent<PlayerController>(true) == FindPrimaryPlayer())
+            focused = true;
         if (!IsPlayer2(__instance))
             return;
         if (__instance.GetComponent<PlayerInput>() != null)
