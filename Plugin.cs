@@ -84,6 +84,22 @@ public class Plugin : BaseUnityPlugin
     static Quaternion _savedGlassesRotation = Quaternion.identity;
     static Color _savedAccent;
     static bool _hasSavedAccent;
+    static GameObject _savedPrimaryBody;
+    static int _savedPrimaryIndex = -1;
+    static Color _savedPrimaryAccent;
+    static bool _hasSavedPrimaryAccent;
+    static GameObject _savedPrimaryHat;
+    static GameObject _savedPrimaryGlasses;
+    static Vector3 _savedPrimaryHatOffset;
+    static Vector3 _savedPrimaryGlassesOffset;
+    static Quaternion _savedPrimaryHatRotation = Quaternion.identity;
+    static Quaternion _savedPrimaryGlassesRotation = Quaternion.identity;
+    static int _primaryLookId;
+    static int _primaryAcceptedId;
+    static int _primarySettleFrames;
+    static bool _applyPrimaryLook;
+    static bool _acceptPrimaryRespawn;
+    static bool _keepPrimaryBody;
         
     private void Awake()
     {
@@ -106,7 +122,10 @@ public class Plugin : BaseUnityPlugin
         _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "UpdateShowCursor"), postfix: new HarmonyMethod(typeof(Plugin), nameof(ApplyMenuCursor)));
         _harmony.Patch(AccessTools.Method(typeof(PlayerNameplateUI), "PreRenderUpdate"), postfix: new HarmonyMethod(typeof(Plugin), nameof(PlaceNameplateForCamera)));
         _harmony.Patch(AccessTools.Method(typeof(InputNavigationManager), "Update"), prefix: new HarmonyMethod(typeof(Plugin), nameof(KeepCustomizeOnButtons)));
-        _harmony.Patch(AccessTools.Method(typeof(PlayerLoadout), nameof(PlayerLoadout.SetLocalLoadout)), postfix: new HarmonyMethod(typeof(Plugin), nameof(ClearCustomizePlayer)));
+        _harmony.Patch(AccessTools.Method(typeof(PlayerLoadout), nameof(PlayerLoadout.SetLocalLoadout)), prefix: new HarmonyMethod(typeof(Plugin), nameof(ProtectPrimaryLoadout)), postfix: new HarmonyMethod(typeof(Plugin), nameof(ClearCustomizePlayer)));
+        var gameOver = AccessTools.Method(typeof(GameOver), nameof(GameOver.SetGameOver));
+        if (gameOver != null)
+            _harmony.Patch(gameOver, prefix: new HarmonyMethod(typeof(Plugin), nameof(KeepPrimaryOnReset)));
         var respawn = AccessTools.Method(typeof(PlayerSpawner), "RespawnInPlace");
         if (respawn != null)
             _harmony.Patch(respawn, prefix: new HarmonyMethod(typeof(Plugin), nameof(BeforeRespawn)), postfix: new HarmonyMethod(typeof(Plugin), nameof(AfterRespawn)));
@@ -193,6 +212,7 @@ public class Plugin : BaseUnityPlugin
             if (_hasSavedAccent)
                 ApplySavedAccent(_player2);
         }
+        TrackPrimaryLook();
         if (_split)
         {
             CreateSplitCamera();
@@ -707,19 +727,19 @@ public class Plugin : BaseUnityPlugin
         var slots = _player2.GetComponentInChildren<CosmeticSlots>(true);
         if (slots == null)
             return false;
-        return AttachSavedCosmetic(slots.HatSlot, _savedHatPrefab, _savedHatOffset, _savedHatRotation)
-            && AttachSavedCosmetic(slots.GlassesSlot, _savedGlassesPrefab, _savedGlassesOffset, _savedGlassesRotation);
+        return AttachSavedCosmetic(_player2, slots.HatSlot, _savedHatPrefab, _savedHatOffset, _savedHatRotation)
+            && AttachSavedCosmetic(_player2, slots.GlassesSlot, _savedGlassesPrefab, _savedGlassesOffset, _savedGlassesRotation);
     }
 
-    static bool AttachSavedCosmetic(CosmeticAttachPoint point, GameObject prefab, Vector3 offset, Quaternion rotation)
+    static bool AttachSavedCosmetic(PlayerController owner, CosmeticAttachPoint point, GameObject prefab, Vector3 offset, Quaternion rotation)
     {
-        if (prefab == null || point == null)
+        if (prefab == null || point == null || owner == null)
             return true;
         if (point.NetworkObject == null || !point.NetworkObject.IsSpawned)
             return false;
         if (point.HasCosmeticAttached())
             return true;
-        var spawned = Util.InstantiateAndSpawnPrefab(prefab, _player2.transform.position + Vector3.up, Quaternion.identity, null, _player2.OwnerClientId);
+        var spawned = Util.InstantiateAndSpawnPrefab(prefab, owner.transform.position + Vector3.up, Quaternion.identity, null, owner.OwnerClientId);
         if (spawned == null || !spawned.TryGetComponent<Item>(out var item))
         {
             if (spawned != null)
@@ -799,12 +819,156 @@ public class Plugin : BaseUnityPlugin
             _customizePlayer = controller;
     }
 
+    static void ProtectPrimaryLoadout()
+    {
+        if (_customizePlayer == null || _customizePlayer != _player2)
+            return;
+        var primary = FindPrimaryPlayer();
+        if (primary != null)
+            RememberPrimaryLook(primary, true);
+    }
+
+    static void KeepPrimaryOnReset()
+    {
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer)
+            return;
+        var primary = FindPrimaryPlayer();
+        if (primary != null)
+            RememberPrimaryLook(primary, true);
+        RestorePrimaryChoice();
+    }
+
+    static void TrackPrimaryLook()
+    {
+        var primary = FindPrimaryPlayer();
+        if (primary == null)
+            return;
+        var id = primary.GetInstanceID();
+        if (id != _primaryLookId)
+        {
+            var seenBefore = _primaryLookId != 0;
+            _primaryLookId = id;
+            if (!seenBefore || _acceptPrimaryRespawn)
+            {
+                _acceptPrimaryRespawn = false;
+                _primaryAcceptedId = id;
+                _applyPrimaryLook = false;
+                _primarySettleFrames = 8;
+            }
+            else
+            {
+                _applyPrimaryLook = _savedPrimaryBody != null || _hasSavedPrimaryAccent || _savedPrimaryHat != null || _savedPrimaryGlasses != null;
+                _primarySettleFrames = 8;
+            }
+        }
+        if (_applyPrimaryLook && ApplyPrimaryLook(primary))
+        {
+            _applyPrimaryLook = false;
+            var body = FindNetworkPrefab(primary.GetComponent<NetworkObject>());
+            if (_savedPrimaryBody == null || body == _savedPrimaryBody)
+                _primaryAcceptedId = id;
+        }
+        var acceptLive = id == _primaryAcceptedId && (_customizePlayer == null || _customizePlayer != _player2);
+        RememberPrimaryLook(primary, acceptLive);
+    }
+
+    static void RememberPrimaryLook(PlayerController player, bool acceptLive)
+    {
+        if (player == null)
+            return;
+        var body = FindNetworkPrefab(player.GetComponent<NetworkObject>());
+        if (body != null && (acceptLive || _savedPrimaryBody == null))
+            _savedPrimaryBody = body;
+        if (acceptLive && _savedPrimaryBody != null && PlayerLoadout.TryGetByOwner(player.OwnerClientId, out var loadout) && loadout != null && loadout.Customization != null)
+        {
+            var characters = loadout.Customization.Characters;
+            var savedHash = _savedPrimaryBody.GetComponent<NetworkObject>() != null ? _savedPrimaryBody.GetComponent<NetworkObject>().PrefabIdHash : 0u;
+            for (var i = 0; i < characters.Length; i++)
+            {
+                var character = characters[i].Prefab;
+                if (character == null)
+                    continue;
+                var characterHash = character.GetComponent<NetworkObject>() != null ? character.GetComponent<NetworkObject>().PrefabIdHash : 0u;
+                if (character == _savedPrimaryBody || (savedHash != 0 && savedHash == characterHash) || character.name == _savedPrimaryBody.name)
+                {
+                    _savedPrimaryIndex = i;
+                    break;
+                }
+            }
+            var accent = player.GetComponentInChildren<AccentColorMaterial>(true);
+            if (accent != null && accent.Renderer != null && accent.Renderer.material.color.a > 0f)
+            {
+                _savedPrimaryAccent = accent.Renderer.material.color;
+                _hasSavedPrimaryAccent = true;
+            }
+        }
+        var slots = player.GetComponentInChildren<CosmeticSlots>(true);
+        var allowClear = acceptLive && _primarySettleFrames <= 0;
+        if (_primarySettleFrames > 0)
+            _primarySettleFrames--;
+        RememberCosmetic(slots != null ? slots.HatSlot : null, ref _savedPrimaryHat, ref _savedPrimaryHatOffset, ref _savedPrimaryHatRotation, allowClear);
+        RememberCosmetic(slots != null ? slots.GlassesSlot : null, ref _savedPrimaryGlasses, ref _savedPrimaryGlassesOffset, ref _savedPrimaryGlassesRotation, allowClear);
+    }
+
+    static bool ApplyPrimaryLook(PlayerController player)
+    {
+        if (player == null)
+            return false;
+        if (_hasSavedPrimaryAccent)
+        {
+            foreach (var accent in player.GetComponentsInChildren<AccentColorMaterial>(true))
+            {
+                if (accent != null && accent.Renderer != null)
+                    accent.Renderer.material.color = _savedPrimaryAccent;
+            }
+        }
+        if (_savedPrimaryHat == null && _savedPrimaryGlasses == null)
+            return true;
+        var slots = player.GetComponentInChildren<CosmeticSlots>(true);
+        if (slots == null)
+            return false;
+        return AttachSavedCosmetic(player, slots.HatSlot, _savedPrimaryHat, _savedPrimaryHatOffset, _savedPrimaryHatRotation)
+            && AttachSavedCosmetic(player, slots.GlassesSlot, _savedPrimaryGlasses, _savedPrimaryGlassesOffset, _savedPrimaryGlassesRotation);
+    }
+
+    static void RestorePrimaryChoice()
+    {
+        if (_savedPrimaryIndex < 0 && !_hasSavedPrimaryAccent)
+            return;
+        if (Options.Instance != null)
+        {
+            if (_savedPrimaryIndex >= 0)
+                Options.Instance.CharacterIndex = _savedPrimaryIndex;
+            if (_hasSavedPrimaryAccent)
+                Options.Instance.AccentColor = _savedPrimaryAccent;
+        }
+        var clientId = NetworkManager.Singleton != null ? NetworkManager.Singleton.LocalClientId : 0UL;
+        var primary = FindPrimaryPlayer();
+        if (primary != null)
+            clientId = primary.OwnerClientId;
+        if (!PlayerLoadout.TryGetByOwner(clientId, out var loadout) || loadout == null || !loadout.IsSpawned)
+            return;
+        var indexVar = AccessTools.Field(typeof(PlayerLoadout), "_characterIndexVar")?.GetValue(loadout) as NetworkVariable<int>;
+        var colorVar = AccessTools.Field(typeof(PlayerLoadout), "_accentColorVar")?.GetValue(loadout) as NetworkVariable<Color>;
+        if (indexVar != null && _savedPrimaryIndex >= 0 && indexVar.Value != _savedPrimaryIndex)
+        {
+            _keepPrimaryBody = true;
+            indexVar.Value = _savedPrimaryIndex;
+            _keepPrimaryBody = false;
+        }
+        if (colorVar != null && _hasSavedPrimaryAccent)
+            colorVar.Value = _savedPrimaryAccent;
+    }
+
     static void ClearCustomizePlayer()
     {
-        if (_customizePlayer != null && _customizePlayer == _player2)
+        var player2Customized = _customizePlayer != null && _customizePlayer == _player2;
+        if (player2Customized)
             SavePlayer2Choice();
         ReleaseCustomizeMenuControl();
         _customizePlayer = null;
+        if (player2Customized)
+            RestorePrimaryChoice();
     }
 
     static void SavePlayer2Choice()
@@ -1249,8 +1413,15 @@ public class Plugin : BaseUnityPlugin
             RestoreNameplateCanvas(_nameplateCanvases[i]);
     }
 
-    static void BeforeRespawn()
+    static bool BeforeRespawn()
     {
+        if (_keepPrimaryBody)
+        {
+            _keepPrimaryBody = false;
+            return false;
+        }
+        if (_customizePlayer != null && _customizePlayer != _player2)
+            _acceptPrimaryRespawn = true;
         _pickCustomizePlayer = _customizePlayer != null;
         _replacingPlayer2 = _customizePlayer != null && _customizePlayer == _player2;
         if (_replacingPlayer2)
@@ -1259,6 +1430,7 @@ public class Plugin : BaseUnityPlugin
         _playersBeforeRespawn = new List<PlayerController>();
         foreach (var player in PlayerController.All)
             _playersBeforeRespawn.Add(player);
+        return true;
     }
 
     static bool PickRespawnPlayer(ulong clientId, ref PlayerController player, ref bool __result)
