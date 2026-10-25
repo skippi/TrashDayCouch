@@ -70,6 +70,20 @@ public class Plugin : BaseUnityPlugin
     static float _player2DeathTime = -1f;
     static bool _spectateSource;
     static bool _spectateSourceKeepsView;
+    static bool _wantPlayer2;
+    static int _splitCameraSourceId;
+    static bool _applyLookPending;
+    static int _lookSettleFrames;
+    static float _nextPlayer2SpawnTime;
+    static GameObject _savedBodyPrefab;
+    static GameObject _savedHatPrefab;
+    static GameObject _savedGlassesPrefab;
+    static Vector3 _savedHatOffset;
+    static Vector3 _savedGlassesOffset;
+    static Quaternion _savedHatRotation = Quaternion.identity;
+    static Quaternion _savedGlassesRotation = Quaternion.identity;
+    static Color _savedAccent;
+    static bool _hasSavedAccent;
         
     private void Awake()
     {
@@ -138,16 +152,20 @@ public class Plugin : BaseUnityPlugin
 
     private void Update()
     {
-        if (_split && _player2 == null)
-            TurnOff();
-
         var keyboard = Keyboard.current;
         if (keyboard != null && keyboard.f10Key.wasPressedThisFrame)
         {
-            if (_player2 != null)
+            if (_player2 != null || _wantPlayer2 || _split)
                 TurnOff();
             else
                 TurnOn();
+        }
+        else if (_player2 == null)
+        {
+            if (_wantPlayer2)
+                RestorePlayer2();
+            else if (_split)
+                TurnOff();
         }
 
         if (_player2 != null)
@@ -167,8 +185,17 @@ public class Plugin : BaseUnityPlugin
         ApplyMenuCursor();
         if (_split)
             KeepNameplatesActive();
+        if (_player2 != null)
+        {
+            if (_applyLookPending && ApplyPlayer2Look())
+                _applyLookPending = false;
+            RememberPlayer2Look();
+            if (_hasSavedAccent)
+                ApplySavedAccent(_player2);
+        }
         if (_split)
         {
+            CreateSplitCamera();
             EnsureMainCameras();
             ApplySplitRects();
             FitHud(FindPrimaryPlayer(), 0f, 0.5f);
@@ -248,12 +275,34 @@ public class Plugin : BaseUnityPlugin
         CreateSplitCamera();
         RestrictPlayer1ToKeyboardMouse();
         ResetHeldButtons();
+        _player2Spectating = false;
+        _player2SpectateTarget = null;
+        _player2DeathTime = -1f;
+        _savedBodyPrefab = prefab;
+        _wantPlayer2 = true;
+        _applyLookPending = true;
+        _lookSettleFrames = 8;
         _split = true;
         Logger.LogInfo($"Player 2 on ({prefab.name}). {ControlHint()}");
     }
 
+    static void RestorePlayer2()
+    {
+        if (Time.unscaledTime < _nextPlayer2SpawnTime)
+            return;
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer || FindPrimaryPlayer() == null)
+            return;
+        _nextPlayer2SpawnTime = Time.unscaledTime + 0.5f;
+        TurnOn();
+    }
+
     static void TurnOff()
     {
+        if (_player2 != null)
+            RememberPlayer2Look();
+        _wantPlayer2 = false;
+        _applyLookPending = false;
+        _splitCameraSourceId = 0;
         ReleaseCustomizeMenuControl();
         if (_player2 != null)
         {
@@ -551,6 +600,9 @@ public class Plugin : BaseUnityPlugin
 
     static GameObject FindSpawnPrefab(PlayerController local)
     {
+        if (_savedBodyPrefab != null)
+            return _savedBodyPrefab;
+
         var prefabs = new List<GameObject>();
         var registered = NetworkManager.Singleton.NetworkConfig != null ? NetworkManager.Singleton.NetworkConfig.Prefabs : null;
         if (registered != null)
@@ -593,32 +645,147 @@ public class Plugin : BaseUnityPlugin
         return networkObject.PrefabIdHash;
     }
 
+    static GameObject FindNetworkPrefab(NetworkObject instance)
+    {
+        if (instance == null || NetworkManager.Singleton == null || NetworkManager.Singleton.NetworkConfig == null)
+            return null;
+        var wantedHash = PrefabHash(instance);
+        var wantedName = instance.name.Replace("(Clone)", "").Trim();
+        foreach (var entry in NetworkManager.Singleton.NetworkConfig.Prefabs.Prefabs)
+        {
+            var prefab = entry.Override == NetworkPrefabOverride.None ? entry.Prefab : entry.OverridingTargetPrefab;
+            if (prefab == null)
+                continue;
+            var networkObject = prefab.GetComponent<NetworkObject>();
+            if (networkObject == null)
+                continue;
+            if ((wantedHash != 0 && networkObject.PrefabIdHash == wantedHash) || prefab.name == wantedName)
+                return prefab;
+        }
+        return null;
+    }
+
+    static void RememberPlayer2Look()
+    {
+        if (_player2 == null)
+            return;
+        var body = FindNetworkPrefab(_player2.GetComponent<NetworkObject>());
+        if (body != null)
+            _savedBodyPrefab = body;
+        var slots = _player2.GetComponentInChildren<CosmeticSlots>(true);
+        var allowClear = _lookSettleFrames <= 0;
+        if (_lookSettleFrames > 0)
+            _lookSettleFrames--;
+        RememberCosmetic(slots != null ? slots.HatSlot : null, ref _savedHatPrefab, ref _savedHatOffset, ref _savedHatRotation, allowClear);
+        RememberCosmetic(slots != null ? slots.GlassesSlot : null, ref _savedGlassesPrefab, ref _savedGlassesOffset, ref _savedGlassesRotation, allowClear);
+    }
+
+    static void RememberCosmetic(CosmeticAttachPoint point, ref GameObject prefab, ref Vector3 offset, ref Quaternion rotation, bool allowClear)
+    {
+        if (point != null && point.TryGetAttachedCosmetic(out var cosmetic) && cosmetic != null)
+        {
+            var found = FindNetworkPrefab(cosmetic.GetComponent<NetworkObject>());
+            if (found != null)
+            {
+                prefab = found;
+                offset = cosmetic.AttachOffset;
+                rotation = cosmetic.AttachRotation;
+            }
+            return;
+        }
+        if (allowClear)
+            prefab = null;
+    }
+
+    static bool ApplyPlayer2Look()
+    {
+        if (_player2 == null)
+            return false;
+        ApplySavedAccent(_player2);
+        if (_savedHatPrefab == null && _savedGlassesPrefab == null)
+            return true;
+        var slots = _player2.GetComponentInChildren<CosmeticSlots>(true);
+        if (slots == null)
+            return false;
+        return AttachSavedCosmetic(slots.HatSlot, _savedHatPrefab, _savedHatOffset, _savedHatRotation)
+            && AttachSavedCosmetic(slots.GlassesSlot, _savedGlassesPrefab, _savedGlassesOffset, _savedGlassesRotation);
+    }
+
+    static bool AttachSavedCosmetic(CosmeticAttachPoint point, GameObject prefab, Vector3 offset, Quaternion rotation)
+    {
+        if (prefab == null || point == null)
+            return true;
+        if (point.NetworkObject == null || !point.NetworkObject.IsSpawned)
+            return false;
+        if (point.HasCosmeticAttached())
+            return true;
+        var spawned = Util.InstantiateAndSpawnPrefab(prefab, _player2.transform.position + Vector3.up, Quaternion.identity, null, _player2.OwnerClientId);
+        if (spawned == null || !spawned.TryGetComponent<Item>(out var item))
+        {
+            if (spawned != null)
+                Destroy(spawned);
+            return true;
+        }
+        item.AttachTo(point, offset, rotation, 0f);
+        return true;
+    }
+
+    static void ApplySavedAccent(PlayerController player)
+    {
+        if (!_hasSavedAccent || player == null)
+            return;
+        foreach (var accent in player.GetComponentsInChildren<AccentColorMaterial>(true))
+        {
+            if (accent != null && accent.Renderer != null)
+                accent.Renderer.material.color = _savedAccent;
+        }
+    }
+
     static void CreateSplitCamera()
     {
         if (!LocalCamera.Instance.TryGet(out var localCamera))
-        {
-            Logger.LogWarning("Player 2 spawned, but there is no local camera to split.");
             return;
+
+        var sourceId = localCamera.GetInstanceID();
+        var splitReady = false;
+        if (_camera2Root != null && _splitCameraSourceId == sourceId)
+        {
+            foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
+            {
+                if (camera != null && camera.enabled)
+                {
+                    splitReady = true;
+                    break;
+                }
+            }
         }
+        if (splitReady)
+            return;
+        if (_camera2Root != null)
+            Destroy(_camera2Root);
 
         _suppressLocalCamera = true;
         _camera2Root = Instantiate(localCamera.gameObject);
         _camera2Root.name = "CouchPlayer2Camera";
         _suppressLocalCamera = false;
+        _splitCameraSourceId = sourceId;
 
         foreach (var listener in _camera2Root.GetComponentsInChildren<AudioListener>(true))
             listener.enabled = false;
         foreach (var extra in _camera2Root.GetComponentsInChildren<LocalCamera>(true))
             extra.enabled = false;
         foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
+        {
             camera.tag = "Untagged";
+            camera.enabled = true;
+        }
 
         _mainCameras.Clear();
         _mainRects.Clear();
         foreach (var camera in localCamera.GetComponentsInChildren<Camera>(true))
         {
             _mainCameras.Add(camera);
-            _mainRects.Add(camera.rect);
+            _mainRects.Add(new Rect(0f, 0f, 1f, 1f));
         }
         ApplySplitRects();
     }
@@ -634,8 +801,24 @@ public class Plugin : BaseUnityPlugin
 
     static void ClearCustomizePlayer()
     {
+        if (_customizePlayer != null && _customizePlayer == _player2)
+            SavePlayer2Choice();
         ReleaseCustomizeMenuControl();
         _customizePlayer = null;
+    }
+
+    static void SavePlayer2Choice()
+    {
+        if (_player2 == null || Options.Instance == null)
+            return;
+        if (PlayerLoadout.TryGetByOwner(_player2.OwnerClientId, out var loadout) && loadout != null && loadout.Customization != null && loadout.Customization.TryGetPrefab(Options.Instance.CharacterIndex, out var prefab))
+            _savedBodyPrefab = prefab;
+        if (Options.Instance.AccentColor.a > 0f)
+        {
+            _savedAccent = Options.Instance.AccentColor;
+            _hasSavedAccent = true;
+            ApplySavedAccent(_player2);
+        }
     }
 
     static bool Player2OwnsCustomizeMenu()
@@ -1070,6 +1253,8 @@ public class Plugin : BaseUnityPlugin
     {
         _pickCustomizePlayer = _customizePlayer != null;
         _replacingPlayer2 = _customizePlayer != null && _customizePlayer == _player2;
+        if (_replacingPlayer2)
+            SavePlayer2Choice();
         _blockCouchFocusSteal = _replacingPlayer2;
         _playersBeforeRespawn = new List<PlayerController>();
         foreach (var player in PlayerController.All)
@@ -1130,6 +1315,11 @@ public class Plugin : BaseUnityPlugin
         ResetHeldButtons();
         if (_camera2Root == null)
             CreateSplitCamera();
+        _lookSettleFrames = 8;
+        ApplySavedAccent(spawned);
+        var body = FindNetworkPrefab(spawned.GetComponent<NetworkObject>());
+        if (body != null)
+            _savedBodyPrefab = body;
         _split = true;
     }
 
@@ -1137,6 +1327,14 @@ public class Plugin : BaseUnityPlugin
     {
         if (!LocalCamera.Instance.TryGet(out var localCamera))
             return;
+        for (var i = _mainCameras.Count - 1; i >= 0; i--)
+        {
+            if (_mainCameras[i] != null)
+                continue;
+            _mainCameras.RemoveAt(i);
+            if (i < _mainRects.Count)
+                _mainRects.RemoveAt(i);
+        }
         foreach (var camera in localCamera.GetComponentsInChildren<Camera>(true))
         {
             if (camera == null || _mainCameras.Contains(camera))
@@ -1148,31 +1346,50 @@ public class Plugin : BaseUnityPlugin
 
     static void ApplySplitRects()
     {
+        var full = new Rect(0f, 0f, 1f, 1f);
         var left = new Rect(0f, 0f, 0.5f, 1f);
         var right = new Rect(0.5f, 0f, 0.5f, 1f);
+        var rightReady = false;
+        if (_camera2Root != null)
+        {
+            foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
+            {
+                if (camera == null || !camera.enabled)
+                    continue;
+                camera.rect = right;
+                rightReady = true;
+            }
+        }
+        var main = rightReady ? left : full;
         foreach (var camera in _mainCameras)
         {
             if (camera != null)
-                camera.rect = left;
+                camera.rect = main;
         }
-        if (_camera2Root == null)
-            return;
-        foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
-            camera.rect = right;
     }
 
     static void RestoreCameras()
     {
+        var full = new Rect(0f, 0f, 1f, 1f);
         for (var i = 0; i < _mainCameras.Count; i++)
         {
             if (_mainCameras[i] != null)
-                _mainCameras[i].rect = _mainRects[i];
+                _mainCameras[i].rect = full;
+        }
+        if (LocalCamera.Instance.TryGet(out var localCamera))
+        {
+            foreach (var camera in localCamera.GetComponentsInChildren<Camera>(true))
+            {
+                if (camera != null)
+                    camera.rect = full;
+            }
         }
         _mainCameras.Clear();
         _mainRects.Clear();
         if (_camera2Root != null)
             Destroy(_camera2Root);
         _camera2Root = null;
+        _splitCameraSourceId = 0;
     }
 
     static void RestrictPlayer1ToKeyboardMouse()
