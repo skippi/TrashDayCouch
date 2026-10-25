@@ -126,7 +126,7 @@ public class Plugin : BaseUnityPlugin
             TurnOff();
 
         var keyboard = Keyboard.current;
-        if (keyboard != null && keyboard.f7Key.wasPressedThisFrame)
+        if (keyboard != null && keyboard.f10Key.wasPressedThisFrame)
         {
             if (_player2 != null)
                 TurnOff();
