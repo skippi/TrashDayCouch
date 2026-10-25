@@ -5,6 +5,7 @@ using System.Reflection;
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
+using FluffyGroomingTool;
 using Ox1;
 using Trash;
 using PlayerInput = Trash.PlayerInput;
@@ -14,6 +15,7 @@ using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
 using UnityEngine.InputSystem.UI;
 using UnityEngine.InputSystem.Utilities;
+using UnityEngine.Rendering;
 using UnityEngine.UIElements;
 
 namespace TrashDayCouch;
@@ -58,8 +60,12 @@ public class Plugin : BaseUnityPlugin
     static List<PlayerController> _playersBeforeRespawn;
     static readonly List<InputAction> _silencedMenuActions = new List<InputAction>();
     static readonly Dictionary<VisualElement, PickingMode> _menuPicking = new Dictionary<VisualElement, PickingMode>();
+    static readonly List<Canvas> _nameplateCanvases = new List<Canvas>();
+    static readonly Dictionary<FurRenderer, Camera> _savedFurCameras = new Dictionary<FurRenderer, Camera>();
+    static readonly List<SkinnedMeshRenderer> _openedFurSkins = new List<SkinnedMeshRenderer>();
     static float _menuNavTime;
-
+    static bool _hidCursorForPlayer2;
+        
     private void Awake()
     {
         Logger = base.Logger;
@@ -78,7 +84,8 @@ public class Plugin : BaseUnityPlugin
             _harmony.Patch(highlight, prefix: new HarmonyMethod(typeof(Plugin), nameof(HighlightForCouchPlayer)));
         _harmony.Patch(AccessTools.Method(typeof(CustomizeInteraction), nameof(CustomizeInteraction.SetPredictedInteracting)), prefix: new HarmonyMethod(typeof(Plugin), nameof(RememberCustomizePlayer)), postfix: new HarmonyMethod(typeof(Plugin), nameof(UpdateCustomizeMenuControl)));
         _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "ShouldShowCursor"), prefix: new HarmonyMethod(typeof(Plugin), nameof(HideCursorForPlayer2Menu)));
-        _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "UpdateShowCursor"), postfix: new HarmonyMethod(typeof(Plugin), nameof(LockCursorForPlayer2Menu)));
+        _harmony.Patch(AccessTools.Method(typeof(MenuSceneManager), "UpdateShowCursor"), postfix: new HarmonyMethod(typeof(Plugin), nameof(ApplyMenuCursor)));
+        _harmony.Patch(AccessTools.Method(typeof(PlayerNameplateUI), "PreRenderUpdate"), postfix: new HarmonyMethod(typeof(Plugin), nameof(PlaceNameplateForCamera)));
         _harmony.Patch(AccessTools.Method(typeof(InputNavigationManager), "Update"), prefix: new HarmonyMethod(typeof(Plugin), nameof(KeepCustomizeOnButtons)));
         _harmony.Patch(AccessTools.Method(typeof(PlayerLoadout), nameof(PlayerLoadout.SetLocalLoadout)), postfix: new HarmonyMethod(typeof(Plugin), nameof(ClearCustomizePlayer)));
         var respawn = AccessTools.Method(typeof(PlayerSpawner), "RespawnInPlace");
@@ -96,13 +103,21 @@ public class Plugin : BaseUnityPlugin
         PatchPromptRefresh("InputIcons.II_ImagePromptBehaviour", "UpdateDisplayedImages");
         PatchPromptRefresh("InputIcons.II_SpritePrompt", "UpdateDisplayedSprites");
         PatchPromptRefresh("InputIcons.II_TextPrompt", "UpdateDisplayedSprites");
+        RenderPipelineManager.beginCameraRendering += BeforeSplitCamera;
         Logger.LogInfo($"Plugin {MyPluginInfo.PLUGIN_GUID} is loaded. Press F7 to toggle player 2.");
     }
 
     private void OnDestroy()
     {
+        RenderPipelineManager.beginCameraRendering -= BeforeSplitCamera;
         TurnOff();
         _harmony?.UnpatchSelf();
+    }
+
+    static void BeforeSplitCamera(ScriptableRenderContext context, Camera camera)
+    {
+        if (_split && IsSplitCamera(camera))
+            KeepNameplatesActive();
     }
 
     private void Update()
@@ -132,8 +147,9 @@ public class Plugin : BaseUnityPlugin
 
     private void LateUpdate()
     {
-        if (Player2OwnsCustomizeMenu())
-            LockCursorForPlayer2Menu();
+        ApplyMenuCursor();
+        if (_split)
+            KeepNameplatesActive();
         if (_split)
         {
             EnsureMainCameras();
@@ -141,6 +157,7 @@ public class Plugin : BaseUnityPlugin
             FitHud(FindPrimaryPlayer(), 0f, 0.5f);
             if (_player2 != null)
                 FitHud(_player2, 0.5f, 1f);
+            AimFurCameras();
         }
     }
 
@@ -232,11 +249,14 @@ public class Plugin : BaseUnityPlugin
         _player2Input = null;
         RestoreHuds();
         RestoreCameras();
+        RestoreNameplateCanvases();
+        RestoreFurCameras();
         RestoreInputDevices();
         ResetHeldButtons();
         if (_split)
             Logger.LogInfo("Player 2 off.");
         _split = false;
+        RestoreLocalNameplate();
     }
 
     static void DrivePlayer2()
@@ -563,7 +583,13 @@ public class Plugin : BaseUnityPlugin
 
     static bool Player2OwnsCustomizeMenu()
     {
-        return _player2 != null && _customizePlayer == _player2 && MenuSceneManager.IsMenuOpen;
+        if (_player2 == null || _customizePlayer != _player2)
+            return false;
+        var ui = UnityEngine.Object.FindFirstObjectByType<CustomizeUI>();
+        if (ui == null || !ui.isActiveAndEnabled)
+            return false;
+        var stack = ui.GetComponentInParent<MenuSceneStack>(true);
+        return stack != null && stack.IsVisible;
     }
 
     static bool HideCursorForPlayer2Menu(ref bool __result)
@@ -574,12 +600,23 @@ public class Plugin : BaseUnityPlugin
         return false;
     }
 
-    static void LockCursorForPlayer2Menu()
+    static void ApplyMenuCursor()
     {
-        if (!Player2OwnsCustomizeMenu())
+        if (Player2OwnsCustomizeMenu())
+        {
+            UnityEngine.Cursor.lockState = CursorLockMode.Locked;
+            UnityEngine.Cursor.visible = false;
+            _hidCursorForPlayer2 = true;
             return;
-        UnityEngine.Cursor.lockState = CursorLockMode.Locked;
-        UnityEngine.Cursor.visible = false;
+        }
+
+        if (!_hidCursorForPlayer2 && !MenuSceneManager.IsMenuOpen)
+            return;
+        _hidCursorForPlayer2 = false;
+        var show = MenuSceneManager.IsMenuOpen;
+        UnityEngine.Cursor.visible = show;
+        if (show)
+            UnityEngine.Cursor.lockState = CursorLockMode.None;
     }
 
     static bool KeepCustomizeOnButtons(InputNavigationManager __instance)
@@ -598,7 +635,7 @@ public class Plugin : BaseUnityPlugin
             return;
         }
 
-        LockCursorForPlayer2Menu();
+        ApplyMenuCursor();
         SilenceCustomizeMenuActions();
         IgnoreCustomizePointer();
         DriveCustomizeMenu();
@@ -731,6 +768,243 @@ public class Plugin : BaseUnityPlugin
         }
         _menuPicking.Clear();
         _menuNavTime = 0f;
+        ApplyMenuCursor();
+    }
+
+    static void KeepNameplatesActive()
+    {
+        foreach (var plate in UnityEngine.Object.FindObjectsByType<PlayerNameplateUI>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (plate == null)
+                continue;
+            ShowNameplateChain(plate.transform);
+            if (plate.Container != null && !plate.Container.gameObject.activeSelf)
+                plate.Container.gameObject.SetActive(true);
+            if (plate.NameText == null)
+                continue;
+            if (IsPlayer2(plate))
+                plate.NameText.text = CouchPlayerName();
+            else if (string.IsNullOrEmpty(plate.NameText.text) && plate.FocusTarget != null && plate.FocusTarget.Controller.TryGet(out var online) && online.PlayerName.TryGet(out var playerName) && !string.IsNullOrEmpty(playerName))
+                plate.NameText.text = playerName;
+        }
+    }
+
+    static void ShowNameplateChain(Transform node)
+    {
+        if (node == null || node.GetComponent<PlayerController>() != null)
+            return;
+        ShowNameplateChain(node.parent);
+        var toggle = node.GetComponent<LocalPlayerFocusToggle>();
+        if (toggle != null && (toggle.Activation == LocalPlayerFocusToggle.ActivationOption.NotFocused || toggle.Activation == LocalPlayerFocusToggle.ActivationOption.NotControlled))
+            toggle.SetState(false, false, false);
+        if (!node.gameObject.activeSelf)
+            node.gameObject.SetActive(true);
+    }
+
+    static void RestoreLocalNameplate()
+    {
+        var primary = FindPrimaryPlayer();
+        if (primary == null)
+            return;
+        var plate = primary.GetComponentInChildren<PlayerNameplateUI>(true);
+        if (plate == null)
+            return;
+        var node = plate.transform;
+        while (node != null && node != primary.transform)
+        {
+            var toggle = node.GetComponent<LocalPlayerFocusToggle>();
+            if (toggle != null && (toggle.Activation == LocalPlayerFocusToggle.ActivationOption.NotFocused || toggle.Activation == LocalPlayerFocusToggle.ActivationOption.NotControlled))
+                toggle.SetState(true, true, false);
+            node = node.parent;
+        }
+    }
+
+    static void PlaceNameplateForCamera(PlayerNameplateUI __instance, Camera c)
+    {
+        if (__instance.Container == null || __instance.CanvasGroup == null)
+            return;
+        var canvas = __instance.Container.GetComponentInParent<Canvas>();
+        if (!_split)
+        {
+            RestoreNameplateCanvas(canvas);
+            return;
+        }
+        if (!IsSplitCamera(c))
+            return;
+        RestoreNameplateCanvas(canvas);
+
+        var viewer = IsPlayer2(__instance) ? SplitCamera(false) : SplitCamera(true);
+        if (viewer == null)
+            return;
+        var position = __instance.transform.position;
+        if (__instance.PlayerPointing != null)
+            position.y += __instance.PlayerPointing.PointingBlend * __instance.PointingHeightOffset;
+        var toCamera = position - viewer.transform.position;
+        if (Vector3.Dot(viewer.transform.forward, toCamera) <= 0f)
+        {
+            __instance.CanvasGroup.alpha = 0f;
+            return;
+        }
+
+        var distance = toCamera.magnitude;
+        __instance.CanvasGroup.alpha = __instance.AlphaForDistance.Eval(distance);
+        __instance.Container.localScale = Vector3.one * __instance.ScaleForDistance.Eval(distance);
+        var viewport = viewer.WorldToViewportPoint(position);
+        var pixel = viewer.pixelRect;
+        var screen = new Vector2(pixel.x + viewport.x * pixel.width, pixel.y + viewport.y * pixel.height);
+        if (RectTransformUtility.ScreenPointToLocalPointInRectangle((RectTransform)__instance.Container.parent, screen, null, out var localPoint))
+            __instance.Container.localPosition = localPoint;
+    }
+
+    static Camera SplitCamera(bool player2)
+    {
+        Camera best = null;
+        var bestArea = 0f;
+        if (player2)
+        {
+            if (_camera2Root == null)
+                return null;
+            foreach (var camera in _camera2Root.GetComponentsInChildren<Camera>(true))
+            {
+                if (camera == null || !camera.enabled)
+                    continue;
+                var area = camera.pixelRect.width * camera.pixelRect.height;
+                if (area > bestArea)
+                {
+                    best = camera;
+                    bestArea = area;
+                }
+            }
+            return best;
+        }
+
+        foreach (var camera in _mainCameras)
+        {
+            if (camera == null || !camera.enabled)
+                continue;
+            var area = camera.pixelRect.width * camera.pixelRect.height;
+            if (area > bestArea)
+            {
+                best = camera;
+                bestArea = area;
+            }
+        }
+        return best;
+    }
+
+    static void AimFurCameras()
+    {
+        var first = SplitCamera(false);
+        var second = SplitCamera(true);
+        foreach (var fur in UnityEngine.Object.FindObjectsByType<FurRenderer>(FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+        {
+            if (fur == null)
+                continue;
+            if (!_savedFurCameras.ContainsKey(fur))
+                _savedFurCameras.Add(fur, fur.lodCamera);
+            var skin = fur.GetComponent<SkinnedMeshRenderer>();
+            if (skin != null && !skin.updateWhenOffscreen)
+            {
+                skin.updateWhenOffscreen = true;
+                _openedFurSkins.Add(skin);
+            }
+            var chosen = FurCameraFor(fur, first, second);
+            if (chosen != null)
+                fur.lodCamera = chosen;
+        }
+    }
+
+    static Camera FurCameraFor(FurRenderer fur, Camera first, Camera second)
+    {
+        var renderer = fur.GetComponent<Renderer>();
+        var bounds = renderer != null ? renderer.bounds : new Bounds(fur.transform.position, Vector3.one * 1.5f);
+        if (bounds.size.sqrMagnitude < 0.0001f)
+            bounds = new Bounds(fur.transform.position, Vector3.one * 1.5f);
+        bounds.Expand(0.4f);
+        var firstScore = FrustumScore(first, bounds);
+        var secondScore = FrustumScore(second, bounds);
+        if (firstScore <= 0 && secondScore <= 0)
+            return null;
+        if (secondScore > firstScore)
+            return second;
+        if (firstScore > secondScore)
+            return first;
+        var origin = bounds.center;
+        var firstDistance = first != null ? (first.transform.position - origin).sqrMagnitude : float.MaxValue;
+        var secondDistance = second != null ? (second.transform.position - origin).sqrMagnitude : float.MaxValue;
+        return secondDistance < firstDistance ? second : first;
+    }
+
+    static int FrustumScore(Camera camera, Bounds bounds)
+    {
+        if (camera == null || !camera.enabled)
+            return 0;
+        var planes = GeometryUtility.CalculateFrustumPlanes(camera);
+        var center = bounds.center;
+        var extents = bounds.extents;
+        var score = 0;
+        for (var x = -1f; x <= 1f; x += 2f)
+        {
+            for (var y = -1f; y <= 1f; y += 2f)
+            {
+                for (var z = -1f; z <= 1f; z += 2f)
+                {
+                    var point = center + Vector3.Scale(extents, new Vector3(x, y, z));
+                    var inside = true;
+                    for (var i = 0; i < planes.Length; i++)
+                    {
+                        if (planes[i].GetDistanceToPoint(point) < -0.05f)
+                        {
+                            inside = false;
+                            break;
+                        }
+                    }
+                    if (inside)
+                        score++;
+                }
+            }
+        }
+        return score;
+    }
+
+    static void RestoreFurCameras()
+    {
+        foreach (var entry in _savedFurCameras)
+        {
+            if (entry.Key != null)
+                entry.Key.lodCamera = entry.Value;
+        }
+        _savedFurCameras.Clear();
+        for (var i = 0; i < _openedFurSkins.Count; i++)
+        {
+            if (_openedFurSkins[i] != null)
+                _openedFurSkins[i].updateWhenOffscreen = false;
+        }
+        _openedFurSkins.Clear();
+    }
+
+    static bool IsSplitCamera(Camera c)
+    {
+        if (c == null)
+            return false;
+        if (_camera2Root != null && c.transform.IsChildOf(_camera2Root.transform))
+            return true;
+        return _mainCameras.Contains(c);
+    }
+
+    static void RestoreNameplateCanvas(Canvas canvas)
+    {
+        if (canvas == null || !_nameplateCanvases.Contains(canvas))
+            return;
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        canvas.worldCamera = null;
+        _nameplateCanvases.Remove(canvas);
+    }
+
+    static void RestoreNameplateCanvases()
+    {
+        for (var i = _nameplateCanvases.Count - 1; i >= 0; i--)
+            RestoreNameplateCanvas(_nameplateCanvases[i]);
     }
 
     static void BeforeRespawn()
@@ -870,7 +1144,7 @@ public class Plugin : BaseUnityPlugin
 
     static bool IsPlayer2(Component component)
     {
-        return _player2 != null && component != null && component.GetComponentInParent<PlayerController>() == _player2;
+        return _player2 != null && component != null && component.GetComponentInParent<PlayerController>(true) == _player2;
     }
 
     static bool SkipPlayer2Input(PlayerInput __instance)
@@ -938,17 +1212,21 @@ public class Plugin : BaseUnityPlugin
         return false;
     }
 
+    static void EnsureNameStyle()
+    {
+        if (_playerNameStyle != null)
+            return;
+        _playerNameStyle = new GUIStyle(GUI.skin.label)
+        {
+            fontSize = 22,
+            fontStyle = FontStyle.Bold
+        };
+    }
+
     static void DrawPlayer2Name()
     {
-        if (_playerNameStyle == null)
-        {
-            _playerNameStyle = new GUIStyle(GUI.skin.label)
-            {
-                fontSize = 22,
-                fontStyle = FontStyle.Bold,
-                alignment = TextAnchor.LowerLeft
-            };
-        }
+        EnsureNameStyle();
+        _playerNameStyle.alignment = TextAnchor.LowerLeft;
         var label = CouchPlayerName();
         var area = new Rect(Screen.width * 0.5f + 28f, Screen.height - 72f, Screen.width * 0.5f - 56f, 40f);
         _playerNameStyle.normal.textColor = new Color(0f, 0f, 0f, 0.85f);
@@ -994,12 +1272,26 @@ public class Plugin : BaseUnityPlugin
 
     static void ShowPlayer2Controls(LocalPlayerFocusToggle __instance, ref bool controlled, ref bool focused)
     {
+        if (_split && IsNameplateToggle(__instance))
+        {
+            if (__instance.Activation == LocalPlayerFocusToggle.ActivationOption.NotFocused)
+                focused = false;
+            if (__instance.Activation == LocalPlayerFocusToggle.ActivationOption.NotControlled)
+                controlled = false;
+        }
         if (!IsPlayer2(__instance))
             return;
         if (__instance.GetComponent<PlayerInput>() != null)
             controlled = true;
         if (__instance.GetComponent<PlayerCamera>() != null || __instance.name == "PlayerHud")
             focused = true;
+    }
+
+    static bool IsNameplateToggle(LocalPlayerFocusToggle toggle)
+    {
+        if (toggle.GetComponent<PlayerController>() != null || toggle.GetComponent<PlayerInput>() != null || toggle.GetComponent<PlayerCamera>() != null)
+            return false;
+        return toggle.GetComponent<PlayerNameplateUI>() != null || toggle.GetComponentInChildren<PlayerNameplateUI>(true) != null;
     }
 
     static PointInput ReadPoint(Gamepad pad, Vector2 move)
