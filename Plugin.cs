@@ -212,6 +212,7 @@ public class Plugin : BaseUnityPlugin
             RememberPlayer2Look();
             if (_hasSavedAccent)
                 ApplySavedAccent(_player2);
+            LinkPlayer2Name();
         }
         TrackPrimaryLook();
         if (_split)
@@ -1715,6 +1716,16 @@ public class Plugin : BaseUnityPlugin
         GUI.Label(new Rect(area.x + 2f, area.y + 2f, area.width, area.height), label, _playerNameStyle);
         _playerNameStyle.normal.textColor = Color.white;
         GUI.Label(area, label, _playerNameStyle);
+    }
+
+    static void LinkPlayer2Name()
+    {
+        if (_player2 == null || NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer)
+            return;
+        var focus = _player2.GetComponent<LocalPlayerFocusTarget>() ?? _player2.GetComponentInChildren<LocalPlayerFocusTarget>(true);
+        if (focus == null || focus.ControllerClientId == _player2.OwnerClientId)
+            return;
+        focus.SetController(_player2.OwnerClientId);
     }
 
     static string CouchPlayerName()
