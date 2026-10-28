@@ -49,6 +49,7 @@ public class Plugin : BaseUnityPlugin
     static readonly Dictionary<string, Sprite> _keySprites = new Dictionary<string, Sprite>();
     static bool _suppressLocalCamera;
     static bool _promptsForGamepad;
+    static int _promptPadCount = -1;
     static GUIStyle _playerNameStyle;
     static bool _throwCameraSwapped;
     static Vector3 _throwCameraPosition;
@@ -191,8 +192,8 @@ public class Plugin : BaseUnityPlugin
         {
             UpdatePlayer2DeathSpectate();
             DrivePlayer2();
-            var gamepadConnected = Gamepad.all.Count > 0;
-            if (gamepadConnected != _promptsForGamepad)
+            AssignPlayer1Devices();
+            if (Gamepad.all.Count != _promptPadCount)
                 ApplyPromptDevices();
         }
 
@@ -293,7 +294,6 @@ public class Plugin : BaseUnityPlugin
         FitHud(_player2, 0.5f, 1f);
         ApplyPromptDevices();
         CreateSplitCamera();
-        RestrictPlayer1ToKeyboardMouse();
         ResetHeldButtons();
         _player2Spectating = false;
         _player2SpectateTarget = null;
@@ -303,6 +303,7 @@ public class Plugin : BaseUnityPlugin
         _applyLookPending = true;
         _lookSettleFrames = 8;
         _split = true;
+        AssignPlayer1Devices();
         Logger.LogInfo($"Player 2 on ({prefab.name}). {ControlHint()}");
     }
 
@@ -367,7 +368,7 @@ public class Plugin : BaseUnityPlugin
             return;
         }
 
-        var gamepad = Gamepad.all.Count > 0 ? Gamepad.all[0] : null;
+        var gamepad = Gamepad.all.Count >= 2 ? Gamepad.all[1] : Gamepad.all.Count > 0 ? Gamepad.all[0] : null;
         var keyboard = Keyboard.current;
         var move = Vector2.zero;
         var look = Vector2.zero;
@@ -1101,7 +1102,7 @@ public class Plugin : BaseUnityPlugin
         var move = Vector2.zero;
         var submit = false;
         var cancel = false;
-        var gamepad = Gamepad.all.Count > 0 ? Gamepad.all[0] : null;
+        var gamepad = Gamepad.all.Count >= 2 ? Gamepad.all[1] : Gamepad.all.Count > 0 ? Gamepad.all[0] : null;
         if (gamepad != null)
         {
             move = gamepad.leftStick.ReadValue();
@@ -1564,11 +1565,18 @@ public class Plugin : BaseUnityPlugin
         _splitCameraSourceId = 0;
     }
 
-    static void RestrictPlayer1ToKeyboardMouse()
+    static void AssignPlayer1Devices()
     {
-        if (InputSystem.actions == null || Keyboard.current == null || Mouse.current == null)
+        if (InputSystem.actions == null)
             return;
-        var devices = new ReadOnlyArray<InputDevice>(new InputDevice[] { Keyboard.current, Mouse.current });
+        InputDevice[] list = null;
+        if (Gamepad.all.Count >= 2)
+            list = new InputDevice[] { Gamepad.all[0] };
+        else if (Keyboard.current != null && Mouse.current != null)
+            list = new InputDevice[] { Keyboard.current, Mouse.current };
+        if (list == null)
+            return;
+        var devices = new ReadOnlyArray<InputDevice>(list);
         foreach (var map in InputSystem.actions.actionMaps)
             map.devices = devices;
         _restrictedDevices = true;
@@ -1585,6 +1593,8 @@ public class Plugin : BaseUnityPlugin
 
     static string ControlHint()
     {
+        if (Gamepad.all.Count >= 2)
+            return "Two controllers: the first drives player 1, the second drives player 2.";
         if (Gamepad.all.Count > 0)
             return "Gamepad: stick move/look, A jump, LB sprint, RT attack, X interact, Y throw, LT bite";
         return "Keys: IJKL move, UO/YH look, N jump, RShift sprint, M attack, , interact, . throw, B bite, G+IJKL emote";
@@ -2069,14 +2079,16 @@ public class Plugin : BaseUnityPlugin
         _hudSize.Clear();
         _hudPosition.Clear();
         _promptsForGamepad = false;
+        _promptPadCount = -1;
     }
 
     static void ApplyPromptDevices()
     {
-        _promptsForGamepad = Gamepad.all.Count > 0;
+        _promptPadCount = Gamepad.all.Count;
+        _promptsForGamepad = _promptPadCount > 0;
         var primary = FindPrimaryPlayer();
         if (primary != null)
-            SetPromptDevice(primary.gameObject, "KeyboardAndMouse");
+            SetPromptDevice(primary.gameObject, _promptPadCount >= 2 ? "Gamepad" : "KeyboardAndMouse");
         if (_player2 != null)
             SetPromptDevice(_player2.gameObject, _promptsForGamepad ? "Gamepad" : "KeyboardAndMouse");
     }
