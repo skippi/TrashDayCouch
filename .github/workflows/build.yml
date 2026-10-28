@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build TrashDayCouch.csproj --configuration Release
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v7
+        with:
+          name: TrashDayCouch
+          if-no-files-found: error
+          path: |
+            bin/Release/netstandard2.1/TrashDayCouch.dll
+            bin/Release/netstandard2.1/TrashDayCouch.pdb
