@@ -13,7 +13,6 @@
       https://nuget.samboy.dev/v3/index.json
     </RestoreAdditionalProjectSources>
     <RootNamespace>TrashDayCouch</RootNamespace>
-    <TrashDayManaged>C:\Program Files (x86)\Steam\steamapps\common\TrashDay\Trash_Data\Managed</TrashDayManaged>
   </PropertyGroup>
 
   <ItemGroup>
@@ -25,27 +24,27 @@
 
   <ItemGroup>
     <Reference Include="Assembly-CSharp">
-      <HintPath>$(TrashDayManaged)\Assembly-CSharp.dll</HintPath>
+      <HintPath>lib\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Unity.Netcode.Runtime">
-      <HintPath>$(TrashDayManaged)\Unity.Netcode.Runtime.dll</HintPath>
+      <HintPath>lib\Unity.Netcode.Runtime.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Unity.InputSystem">
-      <HintPath>$(TrashDayManaged)\Unity.InputSystem.dll</HintPath>
+      <HintPath>lib\Unity.InputSystem.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UI">
-      <HintPath>$(TrashDayManaged)\UnityEngine.UI.dll</HintPath>
+      <HintPath>lib\UnityEngine.UI.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Unity.TextMeshPro">
-      <HintPath>$(TrashDayManaged)\Unity.TextMeshPro.dll</HintPath>
+      <HintPath>lib\Unity.TextMeshPro.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="FluffyGroomingTool">
-      <HintPath>$(TrashDayManaged)\FluffyGroomingTool.dll</HintPath>
+      <HintPath>lib\FluffyGroomingTool.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
